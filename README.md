@@ -21,7 +21,7 @@ Hệ thống kết hợp:
 
 ---
 
-## 1. Thành phần chính
+## III. Thành phần chính
 
 ### 1. Text Embedding
 - jina-embeddings-v3
@@ -38,28 +38,11 @@ Hệ thống kết hợp:
 ### 5. LLM
 - Llama 4 Maverick
 
----
-
-## 2. Cấu trúc
-
-project/
-│
-├── berry_pipeline.py
-├── evaluate_retrieval.py
-├── README.md
-├── .env
-│
-├── dataset/
-│   ├── train.json
-│   ├── public_test.json
-│   ├── train_images/
-│   └── public_test_images/
-│
-├── vlsp2025_law.json
+--
 
 ---
 
-## III Cài đặt
+## IV. Cài đặt
 
 pip install -r requirementes.txt
 
@@ -70,7 +53,7 @@ docker run -p 6333:6333 qdrant/qdrant
 
 --
 
-## IV. Run
+## V. Run
 
 python berry_pipeline.py
 
