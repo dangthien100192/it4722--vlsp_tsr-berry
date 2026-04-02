@@ -1,3 +1,9 @@
-python-dotenv
+torch
+torchvision
+transformers
+Pillow
+numpy
 requests
+python-dotenv
 qdrant-client
+together
