@@ -49,6 +49,12 @@ def safe_div(a: float, b: float) -> float:
     return a / b if b else 0.0
 
 
+def normalize_answer(x: Any) -> str:
+    if x is None:
+        return ""
+    return str(x).strip().upper()
+
+
 # =========================
 # GOLD LAW KEYS
 # =========================
@@ -127,7 +133,6 @@ def normalize_pred_law_entry(x: Any) -> Tuple[str, str]:
 
         return "", ""
 
-    # kiểu cũ: string/int
     s = str(x).strip()
     if not s:
         return "", ""
@@ -318,7 +323,7 @@ def evaluate_examples(
             if ex.get("question_type") == qtype:
                 qtype_match += 1
 
-            if ex.get("answer") == answer:
+            if normalize_answer(ex.get("answer")) == normalize_answer(answer):
                 answer_match += 1
 
             if articles & article_id_set(ex):
@@ -348,6 +353,77 @@ def evaluate_examples(
 
 
 # =========================
+# FINAL ANSWER EVALUATION
+# =========================
+
+def evaluate_answers(predictions: List[Dict[str, Any]], eval_items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    eval_by_id = {x["id"]: x for x in eval_items}
+
+    total = 0
+    correct = 0
+    missing_prediction = 0
+    invalid_prediction = 0
+
+    per_type_total: Dict[str, int] = {}
+    per_type_correct: Dict[str, int] = {}
+
+    debug_rows = []
+
+    for pred in predictions:
+        qid = pred.get("id")
+        if qid not in eval_by_id:
+            continue
+
+        gold_item = eval_by_id[qid]
+        gold_answer = normalize_answer(gold_item.get("answer"))
+        pred_answer = normalize_answer(pred.get("prediction"))
+
+        if not gold_answer:
+            continue
+
+        total += 1
+
+        qtype = str(gold_item.get("question_type", "")).strip() or "UNKNOWN"
+        per_type_total[qtype] = per_type_total.get(qtype, 0) + 1
+
+        if not pred_answer:
+            missing_prediction += 1
+            is_correct = False
+        else:
+            if pred_answer not in {"A", "B", "C", "D"}:
+                invalid_prediction += 1
+            is_correct = (pred_answer == gold_answer)
+
+        if is_correct:
+            correct += 1
+            per_type_correct[qtype] = per_type_correct.get(qtype, 0) + 1
+
+        if len(debug_rows) < 30:
+            debug_rows.append({
+                "id": qid,
+                "question_type": qtype,
+                "gold_answer": gold_answer,
+                "pred_answer": pred_answer,
+                "correct": is_correct,
+            })
+
+    per_type_accuracy = {
+        qtype: safe_div(per_type_correct.get(qtype, 0), cnt)
+        for qtype, cnt in per_type_total.items()
+    }
+
+    return {
+        "total": total,
+        "correct": correct,
+        "accuracy": safe_div(correct, total),
+        "missing_prediction": missing_prediction,
+        "invalid_prediction": invalid_prediction,
+        "per_question_type_accuracy": per_type_accuracy,
+        "sample_debug": debug_rows,
+    }
+
+
+# =========================
 # MAIN
 # =========================
 
@@ -368,10 +444,12 @@ def main():
 
     law_report = evaluate_laws(predictions, eval_items)
     example_report = evaluate_examples(predictions, eval_items, train_items)
+    answer_report = evaluate_answers(predictions, eval_items)
 
     report = {
         "law_retrieval": law_report,
         "example_retrieval": example_report,
+        "answer_evaluation": answer_report,
     }
 
     with open(output_path, "w", encoding="utf-8") as f:
@@ -382,6 +460,9 @@ def main():
 
     print("\n===== EXAMPLE RETRIEVAL =====")
     print(json.dumps(example_report, indent=2, ensure_ascii=False))
+
+    print("\n===== ANSWER EVALUATION =====")
+    print(json.dumps(answer_report, indent=2, ensure_ascii=False))
 
     print(f"\nSaved to {output_path}")
 

@@ -7,3 +7,6 @@ requests
 python-dotenv
 qdrant-client
 together
+timm
+einops
+open-clip-torch
