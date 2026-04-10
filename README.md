@@ -36,7 +36,7 @@ Hệ thống kết hợp:
 - Qdrant
 
 ### 5. LLM
-- Llama 4 Maverick
+- Llama 4 Maverick (Thay thế bằng qwen2.5:7B)
 
 --
 
