@@ -1,9 +1,22 @@
-import json
 import os
+
+# =========================================================
+# GLOBAL HF CACHE CONTROL (set BEFORE importing transformers)
+# =========================================================
+HF_CACHE_ROOT = os.getenv("HF_CACHE_ROOT", r"D:\hf_cache")
+
+os.environ["HF_HOME"] = HF_CACHE_ROOT
+os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(HF_CACHE_ROOT, "hub")
+os.environ["TRANSFORMERS_DYNAMIC_MODULE_NAME"] = "local"
+
+import json
 import re
+import shutil
 import unicodedata
+import importlib.util
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -12,11 +25,103 @@ import torch
 import torchvision.transforms as T
 from PIL import Image
 from dotenv import load_dotenv
+from huggingface_hub import snapshot_download
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 from transformers import AutoModel, Owlv2ForObjectDetection, Owlv2Processor
 
+def auto_clear_hf_dynamic_cache(repo_name: str = "C-RADIOv2-B") -> None:
+    """
+    Xóa các dynamic module cache lỗi của transformers liên quan tới repo_name.
+    """
+    hf_modules = Path(os.environ["HF_HOME"]) / "modules" / "transformers_modules"
+    if not hf_modules.exists():
+        return
 
+    repo_name_norm = repo_name.lower().replace("-", "").replace("_", "")
+    removed = 0
+
+    for d in hf_modules.rglob("*"):
+        if not d.is_dir():
+            continue
+        dn = d.name.lower().replace("-", "").replace("_", "")
+        if repo_name_norm in dn:
+            try:
+                print(f"[AUTO-FIX][HF] Removing broken dynamic cache: {d}")
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+            except Exception as e:
+                print(f"[WARN][HF] Cannot remove {d}: {e}")
+
+    if removed > 0:
+        print(f"[AUTO-FIX][HF] Removed {removed} broken cache folder(s)")
+
+
+def auto_fix_local_model_dir(model_dir: str) -> None:
+    """
+    Nếu model local thiếu file quan trọng thì xóa để tải lại sạch.
+    """
+    p = Path(model_dir).expanduser().resolve()
+    required = [
+        "config.json",
+        "hf_model.py",
+        "radio_model.py",
+        "dual_hybrid_vit.py",
+    ]
+
+    if not p.exists():
+        return
+
+    missing = [f for f in required if not (p / f).exists()]
+    if missing:
+        print(f"[AUTO-FIX][HF] Local model thiếu file {missing} -> removing {p}")
+        shutil.rmtree(p, ignore_errors=True)
+
+
+
+
+def ensure_cradio_dynamic_module(model_dir: str, repo_name: str = "C-RADIOv2-B") -> Path:
+    """
+    Copy các file python của repo C-RADIO sang dynamic module cache để
+    transformers với trust_remote_code=True không bị thiếu file phụ thuộc.
+    """
+    src = Path(model_dir).expanduser().resolve()
+    dst = Path(os.environ["HF_HOME"]) / "modules" / "transformers_modules" / repo_name
+    dst.mkdir(parents=True, exist_ok=True)
+
+    required_py = [
+        "hf_model.py",
+        "radio_model.py",
+        "dual_hybrid_vit.py",
+    ]
+    optional_py = [
+        "__init__.py",
+        "configuration_hf.py",
+        "configuration_radio.py",
+        "modeling_hf.py",
+        "model.py",
+    ]
+
+    copied = []
+    for name in required_py + optional_py:
+        s = src / name
+        d = dst / name
+        if s.exists():
+            shutil.copy2(s, d)
+            copied.append(name)
+
+    init_file = dst / "__init__.py"
+    if not init_file.exists():
+        init_file.write_text("", encoding="utf-8")
+
+    missing = [f for f in required_py if not (dst / f).exists()]
+    if missing:
+        raise RuntimeError(f"Dynamic cache của C-RADIO còn thiếu file: {missing} | dst={dst}")
+
+    print(f"[OK][HF] Prepared dynamic module cache at: {dst}")
+    if copied:
+        print(f"[OK][HF] Copied files: {copied}")
+    return dst
 # =========================================================
 # Load environment early
 # =========================================================
@@ -66,7 +171,9 @@ class Config:
     # Image model flags
     use_image_models: bool = False
     cradio_repo: str = "nvidia/C-RADIOv2-B"
+    cradio_local_dir: str = r"D:\hf_models\C-RADIOv2-B"
     owlv2_repo: str = "google/owlv2-base-patch16-ensemble"
+    owlv2_local_dir: str = r"D:\hf_models\owlv2-base-patch16-ensemble"
 
     # Object detection labels for traffic signs
     owl_queries: Tuple[str, ...] = (
@@ -112,7 +219,9 @@ class Config:
             llm_num_predict=int(os.getenv("LLM_NUM_PREDICT", "16")),
             use_image_models=os.getenv("USE_IMAGE_MODELS", "false").lower() == "true",
             cradio_repo=os.getenv("CRADIO_REPO", "nvidia/C-RADIOv2-B"),
+            cradio_local_dir=os.getenv("CRADIO_LOCAL_DIR", r"D:\hf_models\C-RADIOv2-B"),
             owlv2_repo=os.getenv("OWLV2_REPO", "google/owlv2-base-patch16-ensemble"),
+            owlv2_local_dir=os.getenv("OWLV2_LOCAL_DIR", r"D:\hf_models\owlv2-base-patch16-ensemble"),
         )
         cfg.validate()
         return cfg
@@ -134,14 +243,13 @@ config = Config.from_env()
 # =========================================================
 # Globals / constants
 # =========================================================
-DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device(os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
 MAX_JINA_TEXT_LENGTH = int(os.getenv("MAX_JINA_TEXT_LENGTH", "8192"))
 
 # Text dim is validated at runtime from Jina.
 TEXT_DIM = 0
 
 # Fixed defaults for image/object vectors.
-# Change via env if you already have an indexed collection with specific dims.
 IMAGE_DIM = int(os.getenv("IMAGE_DIM", "1024"))
 OBJECT_DIM = int(os.getenv("OBJECT_DIM", "1024"))
 
@@ -150,27 +258,17 @@ CRADIO_MODEL = None
 OWL_PROCESSOR = None
 OWL_MODEL = None
 
-# Simple transform for C-RADIO.
 CRADIO_TRANSFORM = T.Compose(
     [
-        T.Resize((378, 378)),
+        T.Resize((384, 384)),
         T.ToTensor(),
         T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ]
 )
 
 
-# =========================================================
-# Utility helpers
-# =========================================================
-def normalize_vi_text(text: Any) -> str:
-    """Lowercase + remove accents for softer matching / reranking."""
-    s = str(text or "").strip().lower()
-    s = unicodedata.normalize("NFD", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
-    s = re.sub(r"[^a-z0-9\s./:-]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+def has_module(module_name: str) -> bool:
+    return importlib.util.find_spec(module_name) is not None
 
 
 def compact_text(text: Any, max_len: int = 300) -> str:
@@ -193,9 +291,8 @@ def zero_vec(dim: int) -> List[float]:
 
 
 def extract_sign_codes(text: str) -> List[str]:
-    """Extract codes like P.131, W.247, I.408 for debugging / reranking."""
     s = str(text or "")
-    return sorted(set(re.findall(r"\b([A-Z]\.\d+[A-Z]?)\b", s)))
+    return sorted(set(re.findall(r"\b([A-Z]\.\d+[a-zA-Z]?)\b", s)))
 
 
 def find_choice_label(choice_idx: int) -> str:
@@ -203,11 +300,9 @@ def find_choice_label(choice_idx: int) -> str:
 
 
 def normalize_choices(value: Any) -> List[str]:
-    """Convert dict/list choices into ordered list [A_text, B_text, ...]."""
     if not value:
         return []
     if isinstance(value, dict):
-        # Prefer alphabetic A/B/C/D ordering.
         return [str(value[k]).strip() for k in sorted(value.keys())]
     if isinstance(value, list):
         return [str(x).strip() for x in value]
@@ -226,6 +321,79 @@ def build_choice_map(item: Dict[str, Any]) -> Dict[str, str]:
     return {}
 
 
+def parse_choice_semantics(choice_text: str) -> Dict[str, Any]:
+    c = normalize_vi_text(choice_text)
+    semantics = {
+        "base_intent": None,
+        "constraints": {},
+    }
+
+    if "cấm dừng xe và đỗ xe" in c:
+        semantics["base_intent"] = "no_stopping_no_parking"
+    elif "cấm đỗ xe" in c:
+        semantics["base_intent"] = "no_parking"
+    elif "nơi đỗ xe" in c:
+        semantics["base_intent"] = "parking_place"
+    elif "chú ý xe đỗ" in c:
+        semantics["base_intent"] = "watch_parked_vehicle"
+
+    if "ngày lẻ" in c:
+        semantics["constraints"]["day_parity"] = "odd"
+    elif "ngày chẵn" in c:
+        semantics["constraints"]["day_parity"] = "even"
+
+    return semantics
+
+def law_supports_choice_semantics(choice_sem: Dict[str, Any], payload: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
+    law_sem = payload.get("semantics", {}) or {}
+    base_intents = set(law_sem.get("base_intents", []) or [])
+    variants = law_sem.get("variants", []) or []
+    global_constraints = law_sem.get("global_constraints", {}) or {}
+
+    score = 0.0
+    debug = {
+        "semantic_base_match": False,
+        "semantic_variant_match": False,
+        "semantic_day_matches": [],
+        "semantic_penalty": 0.0,
+    }
+
+    base_intent = choice_sem.get("base_intent")
+    constraints = choice_sem.get("constraints", {}) or {}
+    day_parity = constraints.get("day_parity")
+
+    if not base_intent:
+        return score, debug
+
+    if base_intent in base_intents:
+        debug["semantic_base_match"] = True
+        score += 0.55
+
+    if base_intent == "no_parking":
+        law_days = []
+        for v in variants:
+            c = v.get("constraints", {}) or {}
+            if c.get("day_parity") in {"odd", "even"}:
+                law_days.append(c.get("day_parity"))
+        law_days.extend(global_constraints.get("day_parity", []) or [])
+        law_days = list(dict.fromkeys([x for x in law_days if x]))
+
+        if day_parity:
+            if day_parity in law_days:
+                score += 1.15
+                debug["semantic_variant_match"] = True
+                debug["semantic_day_matches"].append(day_parity)
+            elif law_days:
+                score -= 0.20
+                debug["semantic_penalty"] -= 0.20
+        else:
+            if law_days:
+                score -= 0.35
+                debug["semantic_penalty"] -= 0.35
+
+    return score, debug
+
+
 def format_choice_text(choices: List[str]) -> str:
     return "\n".join(f"{chr(65 + i)}. {c}" for i, c in enumerate(choices))
 
@@ -236,10 +404,6 @@ def is_yes_no_question(question_type: str) -> bool:
 
 
 def get_qa_image_path(base_dir: str, item: Dict[str, Any]) -> Optional[str]:
-    """
-    Resolve image path from image_id.
-    We try a few common extensions to make the script easier to run.
-    """
     image_id = str(item.get("image_id") or "").strip()
     if not image_id:
         return None
@@ -326,7 +490,6 @@ class LawDataset:
                 article_text = str(article.get("text", "")).strip()
                 full_id = f"{law_id}::{article_id}"
 
-                # Keep full text so prompt / rerank can use richer context.
                 parts = []
                 if law_title:
                     parts.append(f"Văn bản: {law_title}")
@@ -340,7 +503,7 @@ class LawDataset:
                     parts.append(article_text)
 
                 full_text = "\n".join(parts).strip()
-                embed_text = full_text[:MAX_JINA_TEXT_LENGTH] if len(full_text) > MAX_JINA_TEXT_LENGTH else full_text
+                embed_text_value = full_text[:MAX_JINA_TEXT_LENGTH] if len(full_text) > MAX_JINA_TEXT_LENGTH else full_text
                 sign_codes = extract_sign_codes(f"{article_title}\n{article_text}")
 
                 normalized.append(
@@ -351,7 +514,7 @@ class LawDataset:
                         "full_id": full_id,
                         "law_title": law_title,
                         "title": article_title,
-                        "text": embed_text,
+                        "text": embed_text_value,
                         "full_text": full_text,
                         "sign_codes": sign_codes,
                         "image_id": None,
@@ -407,28 +570,147 @@ def validate_embedding_dims() -> int:
 
 
 # =========================================================
+# Hugging Face local model helpers
+# =========================================================
+def _is_valid_hf_model_dir(model_dir: Path) -> bool:
+    if not model_dir.exists() or not model_dir.is_dir():
+        return False
+
+    config_ok = (model_dir / "config.json").exists()
+    weight_ok = (
+        (model_dir / "model.safetensors").exists()
+        or (model_dir / "pytorch_model.bin").exists()
+        or (model_dir / "pytorch_model.bin.index.json").exists()
+        or any(model_dir.glob("*.safetensors"))
+    )
+    return config_ok and weight_ok
+
+
+def _ensure_hf_repo_local(
+    repo_id: str,
+    local_dir: str,
+    repo_type: str = "model",
+) -> str:
+    model_path = Path(local_dir).expanduser().resolve()
+
+    if _is_valid_hf_model_dir(model_path):
+        print(f"[INFO][HF] Using cached local model: {model_path}")
+    else:
+        print(f"[INFO][HF] Model chưa có hoặc chưa đầy đủ tại: {model_path}")
+        print(f"[INFO][HF] Downloading repo '{repo_id}' to '{model_path}' ...")
+
+        model_path.mkdir(parents=True, exist_ok=True)
+
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type=repo_type,
+            local_dir=str(model_path),
+            local_dir_use_symlinks=False,
+        )
+
+        if not _is_valid_hf_model_dir(model_path):
+            raise RuntimeError(
+                f"Đã tải repo '{repo_id}' nhưng thư mục '{model_path}' vẫn không hợp lệ."
+            )
+
+        print(f"[OK][HF] Model ready at: {model_path}")
+
+    if repo_id == config.cradio_repo:
+        required_code = [
+            "config.json",
+            "hf_model.py",
+            "radio_model.py",
+            "dual_hybrid_vit.py",
+        ]
+        missing = [f for f in required_code if not (model_path / f).exists()]
+        if missing:
+            raise RuntimeError(
+                f"Repo '{repo_id}' tại '{model_path}' còn thiếu file: {missing}"
+            )
+
+    return str(model_path)
+
+
+# =========================================================
 # Optional image models
 # =========================================================
 @lru_cache(maxsize=1)
 def get_c_radio():
-    model = AutoModel.from_pretrained(
-        r"D:\hf_models\C-RADIOv2-B",
-        trust_remote_code=True,
-        local_files_only=True,
-    )
-    model.eval().to(DEVICE)
-    return model
+    last_error = None
 
+    for attempt in range(1, 3):
+        try:
+            auto_fix_local_model_dir(config.cradio_local_dir)
+            auto_clear_hf_dynamic_cache("C-RADIOv2-B")
+
+            model_dir = _ensure_hf_repo_local(
+                repo_id=config.cradio_repo,
+                local_dir=config.cradio_local_dir,
+                repo_type="model",
+            )
+
+            dyn_dir = ensure_cradio_dynamic_module(model_dir, "C-RADIOv2-B")
+
+            print(f"[INFO][HF] Loading C-RADIO from local dir: {model_dir}")
+            print(f"[INFO][HF] Dynamic module dir: {dyn_dir}")
+
+            model = AutoModel.from_pretrained(
+                model_dir,
+                trust_remote_code=True,
+                local_files_only=True,
+            )
+
+            model = model.to(DEVICE)
+            model.eval()
+            print("[OK][HF] C-RADIO loaded successfully")
+            return model
+
+        except Exception as e:
+            last_error = e
+            print(f"[WARN][HF] get_c_radio attempt {attempt} failed: {e}")
+
+            try:
+                model_dir = Path(config.cradio_local_dir).expanduser().resolve()
+                if model_dir.exists():
+                    print(f"[INFO][HF] Removing local broken model dir: {model_dir}")
+                    shutil.rmtree(model_dir, ignore_errors=True)
+            except Exception as cleanup_err:
+                print(f"[WARN][HF] Cannot remove local model dir: {cleanup_err}")
+
+            try:
+                auto_clear_hf_dynamic_cache("C-RADIOv2-B")
+            except Exception as cleanup_err:
+                print(f"[WARN][HF] Cannot clear transformers cache: {cleanup_err}")
+
+    raise RuntimeError(f"Không thể load C-RADIO sau 2 lần thử. Last error: {last_error}")
 @lru_cache(maxsize=1)
 def get_owl():
-    processor = Owlv2Processor.from_pretrained(config.owlv2_repo)
-    model = Owlv2ForObjectDetection.from_pretrained(config.owlv2_repo)
-    model.eval().to(DEVICE)
+    if not has_module("scipy"):
+        raise RuntimeError(
+            "Thiếu scipy cho OWLv2. Cài bằng: pip install scipy"
+        )
+
+    model_dir = _ensure_hf_repo_local(
+        repo_id=config.owlv2_repo,
+        local_dir=config.owlv2_local_dir,
+        repo_type="model",
+    )
+
+    processor = Owlv2Processor.from_pretrained(
+        model_dir,
+        local_files_only=True,
+    )
+    model = Owlv2ForObjectDetection.from_pretrained(
+        model_dir,
+        local_files_only=True,
+    )
+    model = model.to(DEVICE)
+    model.eval()
     return processor, model
 
 
 def preprocess_c_radio_image(image: Image.Image) -> torch.Tensor:
-    x = CRADIO_TRANSFORM(image).unsqueeze(0)  # (1, 3, H, W)
+    x = CRADIO_TRANSFORM(image).unsqueeze(0)
     return x.to(DEVICE)
 
 
@@ -442,11 +724,63 @@ def load_image(image_path: Optional[str]) -> Optional[Image.Image]:
         return None
 
 
+def _extract_cradio_vector(outputs: Any) -> List[float]:
+    """
+    Robust extractor for C-RADIO outputs.
+    Supports:
+    - torch.Tensor
+    - HF style outputs with pooler_output / last_hidden_state
+    - C-RADIO RadioOutput with summary / features
+    - dict / tuple / list fallbacks
+    """
+    tensor = None
+
+    if isinstance(outputs, torch.Tensor):
+        tensor = outputs
+    elif hasattr(outputs, "summary") and getattr(outputs, "summary") is not None:
+        tensor = getattr(outputs, "summary")
+    elif hasattr(outputs, "features") and getattr(outputs, "features") is not None:
+        feats = getattr(outputs, "features")
+        if isinstance(feats, torch.Tensor):
+            tensor = feats.mean(dim=1) if feats.ndim >= 3 else feats
+    elif hasattr(outputs, "pooler_output") and getattr(outputs, "pooler_output") is not None:
+        tensor = getattr(outputs, "pooler_output")
+    elif hasattr(outputs, "last_hidden_state") and getattr(outputs, "last_hidden_state") is not None:
+        lhs = getattr(outputs, "last_hidden_state")
+        if isinstance(lhs, torch.Tensor):
+            tensor = lhs.mean(dim=1) if lhs.ndim >= 3 else lhs
+    elif isinstance(outputs, dict):
+        for key in ["summary", "pooler_output", "last_hidden_state", "features"]:
+            val = outputs.get(key)
+            if val is None:
+                continue
+            if isinstance(val, torch.Tensor):
+                tensor = val.mean(dim=1) if (key in ["last_hidden_state", "features"] and val.ndim >= 3) else val
+                break
+    elif isinstance(outputs, (tuple, list)) and len(outputs) > 0:
+        first = outputs[0]
+        if isinstance(first, torch.Tensor):
+            tensor = first.mean(dim=1) if first.ndim >= 3 else first
+
+    if tensor is None:
+        attrs = [a for a in dir(outputs) if not a.startswith("__")][:30]
+        raise RuntimeError(
+            f"Không extract được vector từ C-RADIO output: type={type(outputs)}, attrs={attrs}"
+        )
+
+    if not isinstance(tensor, torch.Tensor):
+        raise RuntimeError(f"C-RADIO output không phải tensor sau extract: {type(tensor)}")
+
+    vec = tensor.squeeze(0).detach().cpu().float().flatten().tolist()
+    if len(vec) < IMAGE_DIM:
+        vec = vec + [0.0] * (IMAGE_DIM - len(vec))
+    elif len(vec) > IMAGE_DIM:
+        vec = vec[:IMAGE_DIM]
+    return l2_normalize(vec)
+
+
+
 def embed_image(image_path: Optional[str]) -> List[float]:
-    """
-    Embed image using C-RADIO.
-    If image models are disabled or image missing, return zero vector.
-    """
     if not config.use_image_models:
         return zero_vec(IMAGE_DIM)
 
@@ -460,34 +794,230 @@ def embed_image(image_path: Optional[str]) -> List[float]:
         with torch.no_grad():
             outputs = model(x)
 
-        # Different remote-code models may expose embeddings differently.
-        if isinstance(outputs, torch.Tensor):
-            vec = outputs.squeeze(0).detach().cpu().float().flatten().tolist()
-        elif hasattr(outputs, "pooler_output"):
-            vec = outputs.pooler_output.squeeze(0).detach().cpu().float().flatten().tolist()
-        elif hasattr(outputs, "last_hidden_state"):
-            vec = outputs.last_hidden_state.mean(dim=1).squeeze(0).detach().cpu().float().flatten().tolist()
-        else:
-            raise RuntimeError(f"Không hiểu output của C-RADIO: {type(outputs)}")
-
-        # Keep vector size stable for Qdrant.
-        if len(vec) < IMAGE_DIM:
-            vec = vec + [0.0] * (IMAGE_DIM - len(vec))
-        elif len(vec) > IMAGE_DIM:
-            vec = vec[:IMAGE_DIM]
-        return l2_normalize(vec)
+        return _extract_cradio_vector(outputs)
 
     except Exception as e:
-        print(f"[WARN][IMAGE] embed_image failed for {image_path}: {e}")
+        print(f"[WARN][IMAGE] C-RADIO failed permanently for {image_path}: {e}")
         return zero_vec(IMAGE_DIM)
 
+def parse_question_intent(item: Dict[str, Any]) -> Dict[str, Any]:
+    question = str(item.get("question", "") or "")
+    q_norm = normalize_vi_text(question)  # ✅ dùng có dấu
 
-def detect_objects(image_path: Optional[str], threshold: float = 0.10) -> List[str]:
-    """
-    Detect traffic-sign-related labels with OWLv2.
-    Returns matched text labels, later re-embedded as object text vector.
-    """
+    choice_map = build_choice_map(item)
+    choice_norms = {k: normalize_vi_text(v) for k, v in choice_map.items()}
+
+    topic = "generic_sign"
+
+    if any(x in q_norm for x in [
+        "làn đường", "bên tay trái", "bên trái", "bên phải",
+        "phân làn", "dành riêng cho"
+    ]):
+        topic = "lane_assignment"
+
+    elif any(x in q_norm for x in [
+        "đỗ xe", "dừng xe", "ngày chẵn", "ngày lẻ",
+        "cấm đỗ", "cấm dừng"
+    ]):
+        topic = "parking_restriction"
+
+    elif any(x in q_norm for x in [
+        "tốc độ", "km/h", "vận tốc"
+    ]):
+        topic = "speed_limit"
+
+    elif any(x in q_norm for x in [
+        "nhường đường", "ưu tiên", "đường ưu tiên"
+    ]):
+        topic = "priority"
+
+    elif any(x in q_norm for x in [
+        "hướng đi", "rẽ trái", "rẽ phải",
+        "đi thẳng", "quay đầu"
+    ]):
+        topic = "direction_mandate"
+
+    # =========================
+    # VEHICLES
+    # =========================
+    vehicles: List[str] = []
+    vehicle_map = [
+        ("ô tô", "car"),
+        ("xe tải", "truck"),
+        ("xe buýt", "bus"),
+        ("xe khách", "bus"),
+        ("xe máy", "motorcycle"),
+        ("xe mô tô", "motorcycle"),
+        ("người đi bộ", "pedestrian"),
+    ]
+
+    for phrase, label in vehicle_map:
+        if phrase in q_norm or any(phrase in c for c in choice_norms.values()):
+            vehicles.append(label)
+
+    # =========================
+    # SIDE
+    # =========================
+    side = None
+    if any(x in q_norm for x in [
+        "bên tay trái", "bên trái", "phía trái", "làn trái"
+    ]):
+        side = "left"
+
+    elif any(x in q_norm for x in [
+        "bên tay phải", "bên phải", "phía phải", "làn phải"
+    ]):
+        side = "right"
+
+    # =========================
+    # FEATURES
+    # =========================
+    features: List[str] = []
+
+    if "ngày chẵn" in q_norm:
+        features.append("even_day")
+
+    if "ngày lẻ" in q_norm:
+        features.append("odd_day")
+
+    if "chỉ dành cho" in q_norm or "dành riêng cho" in q_norm:
+        features.append("exclusive")
+
+    if "ô tô" in q_norm:
+        features.append("car")
+
+    return {
+        "question_norm": q_norm,
+        "topic": topic,
+        "vehicles": unique_keep_order(vehicles),
+        "side": side,
+        "features": unique_keep_order(features),
+        "is_yes_no": is_yes_no_question(item.get("question_type", "")),
+    }
+
+def get_question_guided_owl_queries(item: Dict[str, Any]) -> List[str]:
+    intent = parse_question_intent(item)
+    topic = intent.get("topic")
+    queries: List[str] = ["traffic sign"]
+
+    if topic == "parking_restriction":
+        queries.extend([
+            "no parking sign",
+            "no stopping and parking sign",
+            "parking sign",
+            "red slash sign",
+            "even day sign",
+            "odd day sign",
+            "prohibitory sign",
+            "regulatory sign",
+        ])
+    elif topic == "lane_assignment":
+        queries.extend([
+            "lane assignment sign",
+            "lane control sign",
+            "car lane sign",
+            "bus lane sign",
+            "truck lane sign",
+            "motorcycle lane sign",
+            "direction arrow sign",
+            "blue circle sign",
+            "regulatory sign",
+        ])
+    elif topic == "direction_mandate":
+        queries.extend([
+            "direction arrow sign",
+            "mandatory turn sign",
+            "blue circle sign",
+            "regulatory sign",
+        ])
+    elif topic == "priority":
+        queries.extend([
+            "priority sign",
+            "warning sign",
+            "regulatory sign",
+        ])
+    elif topic == "speed_limit":
+        queries.extend([
+            "speed limit sign",
+            "minimum speed sign",
+            "regulatory sign",
+        ])
+    else:
+        queries.extend(list(config.owl_queries))
+
+    return unique_keep_order(queries)
+
+
+def filter_detected_labels_by_intent(labels: List[str], item: Dict[str, Any]) -> List[str]:
+    if not labels:
+        return []
+
+    topic = parse_question_intent(item).get("topic")
+    keyword_groups = {
+        "parking_restriction": ["parking", "stopping", "odd day", "even day", "red slash", "prohibitory", "regulatory"],
+        "lane_assignment": ["lane", "direction arrow", "blue circle", "regulatory", "car lane", "bus lane", "truck lane", "motorcycle lane"],
+        "direction_mandate": ["direction", "arrow", "blue circle", "regulatory"],
+        "priority": ["priority", "warning", "regulatory"],
+        "speed_limit": ["speed", "regulatory"],
+    }
+
+    keywords = keyword_groups.get(topic, [])
+    filtered = [label for label in labels if (not keywords) or any(k in label.lower() for k in keywords)]
+    if filtered:
+        return unique_keep_order(filtered)
+
+    fallbacks = [x for x in labels if x.lower() in {"traffic sign", "regulatory sign", "warning sign", "priority sign", "prohibitory sign"}]
+    return unique_keep_order(fallbacks[:3] or labels[:3])
+
+
+OWL_LABEL_VI_MAP: Dict[str, str] = {
+    "traffic sign": "biển báo giao thông",
+    "no parking sign": "biển cấm đỗ xe",
+    "no stopping and parking sign": "biển cấm dừng xe và đỗ xe",
+    "parking sign": "biển nơi đỗ xe",
+    "warning sign": "biển cảnh báo",
+    "priority sign": "biển ưu tiên",
+    "prohibitory sign": "biển báo cấm",
+    "regulatory sign": "biển hiệu lệnh",
+    "blue circle sign": "biển tròn xanh",
+    "red slash sign": "vạch chéo đỏ",
+    "even day sign": "biển ngày chẵn",
+    "odd day sign": "biển ngày lẻ",
+    "lane assignment sign": "biển phân làn",
+    "lane control sign": "biển điều khiển làn đường",
+    "car lane sign": "biển làn dành cho ô tô",
+    "bus lane sign": "biển làn dành cho xe buýt",
+    "truck lane sign": "biển làn dành cho xe tải",
+    "motorcycle lane sign": "biển làn dành cho xe mô tô",
+    "direction arrow sign": "biển mũi tên chỉ hướng",
+    "mandatory turn sign": "biển bắt buộc rẽ",
+    "speed limit sign": "biển hạn chế tốc độ tối đa",
+    "minimum speed sign": "biển tốc độ tối thiểu",
+}
+
+
+def translate_detected_labels_to_vi(labels: List[str]) -> List[str]:
+    translated: List[str] = []
+    seen = set()
+    for label in labels or []:
+        key = str(label or "").strip()
+        vi = OWL_LABEL_VI_MAP.get(key, key)
+        if vi and vi not in seen:
+            seen.add(vi)
+            translated.append(vi)
+    return translated
+
+
+def detect_objects(
+    image_path: Optional[str],
+    threshold: float = 0.10,
+    text_queries: Optional[List[str]] = None,
+) -> List[str]:
     if not config.use_image_models:
+        return []
+
+    if not has_module("scipy"):
+        print("[WARN][OBJECT] scipy chưa được cài -> bỏ qua object detection. Cài bằng: pip install scipy")
         return []
 
     image = load_image(image_path)
@@ -496,14 +1026,14 @@ def detect_objects(image_path: Optional[str], threshold: float = 0.10) -> List[s
 
     try:
         processor, model = get_owl()
-        text_queries = list(config.owl_queries)
+        text_queries = list(text_queries or config.owl_queries)
         inputs = processor(text=text_queries, images=image, return_tensors="pt").to(DEVICE)
 
         with torch.no_grad():
             outputs = model(**inputs)
 
         target_sizes = torch.tensor([image.size[::-1]], device=DEVICE)
-        results = processor.post_process_object_detection(outputs=outputs, threshold=threshold, target_sizes=target_sizes)
+        results = processor.post_process_grounded_object_detection(outputs=outputs, threshold=threshold, target_sizes=target_sizes)
 
         labels: List[str] = []
         if results:
@@ -512,31 +1042,33 @@ def detect_objects(image_path: Optional[str], threshold: float = 0.10) -> List[s
                 if 0 <= label_idx < len(text_queries):
                     labels.append(text_queries[label_idx])
 
-        # Deduplicate but preserve order.
-        deduped: List[str] = []
-        seen = set()
-        for x in labels:
-            if x not in seen:
-                deduped.append(x)
-                seen.add(x)
-        return deduped
+        return unique_keep_order(labels)
 
     except Exception as e:
         print(f"[WARN][OBJECT] detect_objects failed for {image_path}: {e}")
         return []
 
 
-def embed_objects(image_path: Optional[str]) -> List[float]:
-    """
-    Turn detected object labels into a vector.
-    We reuse Jina passage embedding on object-label text for a stable vector space.
-    """
-    labels = detect_objects(image_path)
+def embed_objects(
+    image_path: Optional[str],
+    item: Optional[Dict[str, Any]] = None,
+    labels: Optional[List[str]] = None,
+) -> List[float]:
+    labels = list(labels or [])
+    if not labels:
+        guided_queries = get_question_guided_owl_queries(item or {}) if item else None
+        labels_en = detect_objects(image_path, text_queries=guided_queries)
+        if item:
+            labels_en = filter_detected_labels_by_intent(labels_en, item)
+        labels = translate_detected_labels_to_vi(labels_en)
+    else:
+        labels = translate_detected_labels_to_vi(labels)
+
     if not labels:
         return zero_vec(OBJECT_DIM)
 
     try:
-        object_text = "Detected objects: " + ", ".join(labels)
+        object_text = "Đặc trưng nhận diện được trong ảnh: " + ", ".join(labels)
         vec = embed_text_passage(object_text)
         if len(vec) < OBJECT_DIM:
             vec = vec + [0.0] * (OBJECT_DIM - len(vec))
@@ -548,10 +1080,27 @@ def embed_objects(image_path: Optional[str]) -> List[float]:
         return zero_vec(OBJECT_DIM)
 
 
-def build_image_description(image_path: Optional[str]) -> str:
-    labels = detect_objects(image_path)
+def build_image_description(
+    image_path: Optional[str],
+    item: Optional[Dict[str, Any]] = None,
+    labels: Optional[List[str]] = None,
+) -> str:
+    labels = list(labels or [])
     if not labels:
-        return "Không nhận diện được đặc trưng biển báo rõ ràng từ module object detection."
+        guided_queries = get_question_guided_owl_queries(item or {}) if item else None
+        labels_en = detect_objects(image_path, text_queries=guided_queries)
+        if item:
+            labels_en = filter_detected_labels_by_intent(labels_en, item)
+        labels = translate_detected_labels_to_vi(labels_en)
+    else:
+        labels = translate_detected_labels_to_vi(labels)
+
+    if not labels:
+        return "Không nhận diện được đặc trưng phù hợp với câu hỏi từ module object detection."
+
+    if item:
+        intent = parse_question_intent(item)
+        return f"Các đối tượng/đặc trưng phù hợp với câu hỏi (topic={intent.get('topic')}): " + ", ".join(labels)
     return "Các đối tượng/đặc trưng nhận diện được: " + ", ".join(labels)
 
 
@@ -571,10 +1120,6 @@ def collection_has_data(client: QdrantClient, collection_name: str) -> bool:
 
 
 def ensure_collection(client: QdrantClient, collection_name: str) -> None:
-    """
-    Ensure collection exists with named vectors: text / image / objects.
-    If dims mismatch and RECREATE_ON_DIM_MISMATCH=true, the collection is recreated.
-    """
     expected_vectors = {
         "text": VectorParams(size=TEXT_DIM, distance=Distance.COSINE),
         "image": VectorParams(size=IMAGE_DIM, distance=Distance.COSINE),
@@ -628,10 +1173,6 @@ def search_named_vector(
     vector: List[float],
     limit: int,
 ) -> List[Dict[str, Any]]:
-    """
-    Search Qdrant collection by one named vector.
-    We support both newer and older qdrant-client call styles.
-    """
     if not vector or not any(abs(v) > 1e-12 for v in vector):
         return []
 
@@ -669,10 +1210,6 @@ def fuse_hits(
     limit: int,
     weights: Tuple[float, float, float] = (0.60, 0.25, 0.15),
 ) -> List[Dict[str, Any]]:
-    """
-    Weighted late fusion on hit ids.
-    Scores from separate retrieval channels are summed after multiplying weights.
-    """
     fused: Dict[str, Dict[str, Any]] = {}
 
     def _add(hits: List[Dict[str, Any]], weight: float, channel: str) -> None:
@@ -706,6 +1243,15 @@ def build_query_text(item: Dict[str, Any]) -> str:
     if item.get("question_type"):
         lines.append(f"Loại câu hỏi: {item['question_type']}")
 
+    intent = parse_question_intent(item)
+    lines.append(f"Topic suy luận: {intent.get('topic')}")
+    if intent.get("side"):
+        lines.append(f"Vị trí/làn quan tâm: {intent.get('side')}")
+    if intent.get("vehicles"):
+        lines.append("Loại phương tiện liên quan: " + ", ".join(intent.get("vehicles", [])))
+    if intent.get("features"):
+        lines.append("Đặc trưng cần ưu tiên: " + ", ".join(intent.get("features", [])))
+
     choice_map = build_choice_map(item)
     if choice_map:
         lines.append("Lựa chọn:")
@@ -733,16 +1279,9 @@ def build_query_text(item: Dict[str, Any]) -> str:
 
 
 # =========================================================
-# Law reranking: boost hits that align with answer choices
+# Law reranking
 # =========================================================
 def score_law_against_choices(item: Dict[str, Any], payload: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
-    """
-    Soft reranking after vector retrieval.
-    Main idea:
-    - keep semantic base score from vector DB
-    - add small boosts when law title/text directly matches choice text
-    - add extra boosts for highly discriminative phrases
-    """
     choice_map = build_choice_map(item)
     combined = " ".join(
         [
@@ -759,17 +1298,16 @@ def score_law_against_choices(item: Dict[str, Any], payload: Dict[str, Any]) -> 
     matched_phrases: List[str] = []
 
     discriminative_phrases = [
-        "cam dung xe va do xe",
-        "cam do xe",
-        "cam do xe vao ngay le",
-        "cam do xe vao ngay chan",
-        "ngay le",
-        "ngay chan",
-        "noi do xe",
-        "chu y xe do",
+        "cấm dừng xe và đỗ xe",
+        "cấm đỗ xe",
+        "cấm đỗ xe vào ngày lẻ",
+        "cấm đỗ xe vào ngày chẵn",
+        "ngày lẻ",
+        "ngày chẵn",
+        "nơi đỗ xe",
+        "chú ý xe đỗ",
     ]
 
-    # 1) direct option-text match
     for label, choice_text in choice_map.items():
         c_norm = normalize_vi_text(choice_text)
         if len(c_norm) >= 4 and c_norm in combined_norm:
@@ -777,7 +1315,6 @@ def score_law_against_choices(item: Dict[str, Any], payload: Dict[str, Any]) -> 
             matched_choices.append(label)
             matched_phrases.append(choice_text)
 
-    # 2) discriminative phrase match for finer-grained variants
     for phrase in discriminative_phrases:
         if phrase in combined_norm:
             for label, choice_text in choice_map.items():
@@ -788,7 +1325,6 @@ def score_law_against_choices(item: Dict[str, Any], payload: Dict[str, Any]) -> 
                     if choice_text not in matched_phrases:
                         matched_phrases.append(choice_text)
 
-    # 3) small hint if question asks directly about sign identity
     question_norm = normalize_vi_text(item.get("question", ""))
     title_norm = normalize_vi_text(payload.get("title", ""))
     codes = extract_sign_codes(str(payload.get("title", "")))
@@ -803,12 +1339,139 @@ def score_law_against_choices(item: Dict[str, Any], payload: Dict[str, Any]) -> 
     return score_boost, debug
 
 
+def score_yes_no_law_hit(item: Dict[str, Any], payload: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
+    """
+    Chấm law hit cho câu Đúng/Sai.
+    Mục tiêu:
+    - lấy term chính từ câu hỏi
+    - tìm overlap trong luật
+    - suy ra support_true / support_false từ một số pattern phổ biến
+    """
+    question = str(item.get("question", "") or "")
+    title = str(payload.get("title", "") or "")
+    text = str(payload.get("text", "") or "")
+    full_text = str(payload.get("full_text", "") or "")
+
+    q = normalize_vi_text(question)
+    doc = normalize_vi_text(" ".join([title, text, full_text]))
+
+    debug: Dict[str, Any] = {
+        "question_norm": q,
+        "matched_terms": [],
+        "support_true": 0.0,
+        "support_false": 0.0,
+        "predicted_label": None,
+        "overlap_score": 0.0,
+        "sign_codes": extract_sign_codes(str(title)),
+        "reason": "yesno_scoring",
+    }
+
+    if not q or not doc:
+        debug["reason"] = "empty_question_or_doc"
+        return 0.0, debug
+
+    candidate_terms: List[str] = []
+
+    # Trích cụm trong ngoặc kép nếu có
+    for pat in [r'"([^"]+)"', r"“([^”]+)”", r"'([^']+)'"]:
+        for m in re.findall(pat, question):
+            term = normalize_vi_text(m)
+            if term and len(term) >= 3:
+                candidate_terms.append(term)
+
+    hand_terms = [
+        "giữ khoảng cách an toàn",
+        "chữ màu vàng",
+        "nền đen",
+        "nền vàng",
+        "chữ đen",
+        "chữ trắng",
+        "biển chỉ dẫn",
+        "biển cảnh báo",
+        "biển báo cấm",
+        "biển hiệu lệnh",
+        "biển viết bằng chữ",
+    ]
+    for term in hand_terms:
+        if term in q:
+            candidate_terms.append(term)
+
+    candidate_terms = list(dict.fromkeys(candidate_terms))
+
+    overlap_score = 0.0
+    matched_terms: List[str] = []
+    for term in candidate_terms:
+        if term in doc:
+            overlap_score += 0.12
+            matched_terms.append(term)
+
+    support_true = 0.0
+    support_false = 0.0
+
+    has_yellow_text_claim = "chu mau vang" in q or "chu vang" in q
+    has_black_bg_claim = "nen den" in q
+    has_yellow_bg_claim = "nen vang" in q
+    has_black_text_claim = "chu den" in q
+    has_white_text_claim = "chu trang" in q
+    asks_safe_distance = "giu khoang cach an toan" in q
+
+    law_mentions_safe_distance = "giu khoang cach an toan" in doc
+    law_mentions_guide_sign = "bien chi dan" in doc or "chi dan" in doc
+
+    doc_has_yellow_bg_black_text = "nen vang" in doc and "chu den" in doc
+    doc_has_black_bg_yellow_text = "nen den" in doc and ("chu vang" in doc or "chu mau vang" in doc)
+    doc_has_blue_bg_white_text = ("nen xanh" in doc or "nen mau xanh" in doc) and "chu trang" in doc
+    doc_has_red_bg_white_text = ("nen do" in doc or "nen mau do" in doc) and "chu trang" in doc
+
+    if asks_safe_distance and law_mentions_safe_distance:
+        support_true += 0.18
+
+    if asks_safe_distance and law_mentions_guide_sign:
+        support_true += 0.10
+
+    if has_yellow_bg_claim and has_black_text_claim and doc_has_yellow_bg_black_text:
+        support_true += 0.50
+    if has_black_bg_claim and has_yellow_text_claim and doc_has_black_bg_yellow_text:
+        support_true += 0.50
+
+    if has_black_bg_claim and has_yellow_text_claim and doc_has_yellow_bg_black_text:
+        support_false += 0.70
+    if has_yellow_bg_claim and has_black_text_claim and doc_has_black_bg_yellow_text:
+        support_false += 0.70
+
+    if (has_yellow_text_claim or has_black_bg_claim or has_yellow_bg_claim or has_black_text_claim) and doc_has_blue_bg_white_text:
+        support_false += 0.35
+
+    if (has_yellow_text_claim or has_black_bg_claim or has_yellow_bg_claim or has_black_text_claim) and doc_has_red_bg_white_text:
+        support_false += 0.20
+
+    # Một số hỗ trợ đúng trực tiếp cho claim nền/chữ
+    if has_white_text_claim and "chu trang" in doc:
+        support_true += 0.18
+
+    final_support = overlap_score + max(support_true, support_false)
+
+    debug["matched_terms"] = matched_terms
+    debug["support_true"] = round(support_true, 6)
+    debug["support_false"] = round(support_false, 6)
+    debug["predicted_label"] = "ĐÚNG" if support_true > support_false else "SAI" if support_false > support_true else None
+    debug["overlap_score"] = round(overlap_score, 6)
+
+    return final_support, debug
+
+
 def rerank_law_hits(item: Dict[str, Any], law_hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     reranked: List[Dict[str, Any]] = []
+    yes_no_mode = is_yes_no_question(item.get("question_type", ""))
+
     for hit in law_hits:
         payload = hit.get("payload", {})
         base_score = float(hit.get("score", 0.0))
-        boost, debug = score_law_against_choices(item, payload)
+
+        if yes_no_mode:
+            boost, debug = score_yes_no_law_hit(item, payload)
+        else:
+            boost, debug = score_law_against_choices(item, payload)
 
         new_hit = dict(hit)
         new_hit["base_score"] = base_score
@@ -821,21 +1484,235 @@ def rerank_law_hits(item: Dict[str, Any], law_hits: List[Dict[str, Any]]) -> Lis
     return reranked
 
 
+def score_choices_from_laws(
+    item: Dict[str, Any],
+    retrieved_laws: List[Dict[str, Any]],
+    image_description: str = "",
+) -> Dict[str, float]:
+
+    choice_map = build_choice_map(item)
+    scores: Dict[str, float] = {label: 0.0 for label in choice_map}
+
+    if not choice_map or not retrieved_laws:
+        return scores
+
+    norm_choice_map = {label: normalize_vi_text(text) for label, text in choice_map.items()}
+    choice_sem_map = {label: parse_choice_semantics(text) for label, text in choice_map.items()}
+
+    image_desc_norm = normalize_vi_text(image_description)
+
+    # =====================================================
+    # 1. IMAGE SIGNAL (rất mạnh)
+    # =====================================================
+    if "ngày chẵn" in image_desc_norm:
+        for label, text in norm_choice_map.items():
+            if "ngày chẵn" in text:
+                scores[label] += 3.0
+
+    if "ngày lẻ" in image_desc_norm:
+        for label, text in norm_choice_map.items():
+            if "ngày lẻ" in text:
+                scores[label] += 3.0
+
+    # =====================================================
+    # 2. LAW-BASED SCORING
+    # =====================================================
+    for rank, hit in enumerate(retrieved_laws[:5], 1):
+        payload = hit.get("payload", {})
+        debug = hit.get("debug", {}) or {}
+
+        rank_weight = 1.0 / rank
+        fused_score = float(hit.get("score", 0.0))
+
+        title_norm = normalize_vi_text(payload.get("title", ""))
+        text_norm = normalize_vi_text(payload.get("text", "") or payload.get("full_text", ""))
+        combined_norm = f"{title_norm} {text_norm}"
+
+        matched_choices = set(debug.get("matched_choices", []) or [])
+
+        # =================================================
+        # 2.1 TEXT MATCH (yếu)
+        # =================================================
+        for label, choice_norm in norm_choice_map.items():
+            if choice_norm and choice_norm in combined_norm:
+                scores[label] += 0.3 * rank_weight
+
+        # =================================================
+        # 2.2 MATCH từ rerank debug
+        # =================================================
+        for label in matched_choices:
+            if label in scores:
+                scores[label] += 0.25 * rank_weight
+
+        # =================================================
+        # 2.3 SEMANTIC MATCH (QUAN TRỌNG)
+        # =================================================
+        variants = payload.get("semantics", {}).get("variants", [])
+
+        for v in variants:
+            constraints = v.get("constraints", {})
+
+            # ---- ngày chẵn ----
+            if constraints.get("day_parity") == "even":
+                for label, text in norm_choice_map.items():
+                    if "ngày chẵn" in text:
+                        scores[label] += 1.5 * rank_weight
+            # ---- ngày lẻ ----
+            if constraints.get("day_parity") == "odd":
+                for label, text in norm_choice_map.items():
+                    if "ngày lẻ" in text:
+                        scores[label] += 1.5 * rank_weight
+
+        # =================================================
+        # 2.4 BASE INTENT MATCH
+        # =================================================
+        base_intents = payload.get("semantics", {}).get("base_intents", [])
+
+        for label, sem in choice_sem_map.items():
+            if sem.get("base_intent") in base_intents:
+                scores[label] += 0.5 * rank_weight
+
+        # =================================================
+        # 2.5 BOOST theo fused_score
+        # =================================================
+        for label in scores:
+            scores[label] += min(fused_score, 2.0) * 0.1 * rank_weight
+
+    # =====================================================
+    # 3. PENALTY LOGIC (QUAN TRỌNG)
+    # =====================================================
+
+    # Nếu có lựa chọn ngày lẻ/chẵn → giảm điểm generic
+    has_day_variant = any(
+        "ngày chẵn" in normalize_vi_text(c) or "ngày lẻ" in normalize_vi_text(c)
+        for c in choice_map.values()
+    )
+
+    if has_day_variant:
+        for label, text in norm_choice_map.items():
+            if text == "cấm đỗ xe":
+                scores[label] -= 1.0
+
+    if "ngày chẵn" in image_desc_norm:
+        for label, text in norm_choice_map.items():
+            if "ngày chẵn" not in text:
+                scores[label] -= 0.5
+
+    if "ngày lẻ" in image_desc_norm:
+        for label, text in norm_choice_map.items():
+            if "ngày lẻ" not in text:
+                scores[label] -= 0.5
+
+    return scores
+
+def choose_by_law_priority(item: Dict[str, Any], retrieved_laws: List[Dict[str, Any]]) -> Tuple[Optional[str], Dict[str, Any]]:
+    if not retrieved_laws:
+        return None, {"reason": "not_applicable", "choice_scores": {}}
+
+    if is_yes_no_question(item.get("question_type", "")):
+        support_true = 0.0
+        support_false = 0.0
+
+        for hit in retrieved_laws[:3]:
+            dbg = hit.get("debug", {}) or {}
+            fused_score = float(hit.get("score", 0.0))
+            st = float(dbg.get("support_true", 0.0))
+            sf = float(dbg.get("support_false", 0.0))
+            overlap = float(dbg.get("overlap_score", 0.0))
+
+            support_true += fused_score * max(st + 0.20 * overlap, 0.0)
+            support_false += fused_score * max(sf + 0.20 * overlap, 0.0)
+
+        debug = {
+            "reason": "yesno_aggregate",
+            "support_true": round(support_true, 6),
+            "support_false": round(support_false, 6),
+        }
+
+        if support_true == 0.0 and support_false == 0.0:
+            debug["reason"] = "not_applicable"
+            return None, debug
+
+        gap = abs(support_true - support_false)
+        debug["support_gap"] = round(gap, 6)
+
+        if gap < 0.05:
+            debug["reason"] = "weak_gap"
+            return None, debug
+
+        return ("ĐÚNG", debug) if support_true > support_false else ("SAI", debug)
+
+    choice_map = build_choice_map(item)
+    if not choice_map:
+        return None, {"reason": "not_applicable", "choice_scores": {}}
+
+    choice_scores = score_choices_from_laws(item, retrieved_laws, image_description=item.get("image_description", ""))
+    ranked = sorted(choice_scores.items(), key=lambda kv: kv[1], reverse=True)
+    if not ranked:
+        return None, {"reason": "no_choice_scores", "choice_scores": choice_scores}
+
+    best_label, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else -999.0
+    top1 = retrieved_laws[0]
+    top2 = retrieved_laws[1] if len(retrieved_laws) > 1 else None
+    top1_title_norm = normalize_vi_text(top1.get("payload", {}).get("title", ""))
+    best_choice_norm = normalize_vi_text(choice_map.get(best_label, ""))
+    exact_title_match = bool(best_choice_norm and best_choice_norm == top1_title_norm)
+    top_gap = float(top1.get("score", 0.0)) - float(top2.get("score", 0.0)) if top2 else float(top1.get("score", 0.0))
+    choice_gap = best_score - second_score
+
+    debug = {
+        "choice_scores": choice_scores,
+        "ranked_choice_scores": ranked,
+        "top_gap": top_gap,
+        "choice_gap": choice_gap,
+        "exact_title_match": exact_title_match,
+        "top1_title": top1.get("payload", {}).get("title", ""),
+    }
+
+    if exact_title_match and top_gap >= 0.10:
+        debug["reason"] = "exact_title_match"
+        return best_label, debug
+
+    if best_score >= 1.15 and choice_gap >= 0.35:
+        debug["reason"] = "strong_choice_score_gap"
+        return best_label, debug
+
+    matched_choices = top1.get("debug", {}).get("matched_choices", []) or []
+    if len(matched_choices) == 1 and matched_choices[0] in choice_map and top_gap >= 0.08:
+        debug["reason"] = "single_matched_choice"
+        return matched_choices[0], debug
+
+    debug["reason"] = "no_force"
+    return None, debug
+
+
+# =========================================================
+# Indexing
 # =========================================================
 # Indexing
 # =========================================================
 def index_examples(client: QdrantClient, dataset: QaDataset) -> None:
     ensure_collection(client, config.collection_examples)
-    points: List[PointStruct] = []
+    success_count = 0
+    fail_count = 0
 
     for idx, item in enumerate(dataset):
+        print(f"[BEGIN][EXAMPLE] {idx}")
         image_path = get_qa_image_path(config.train_image_dir, item)
         query_text = build_query_text(item)
 
         try:
             text_vec = embed_text_passage(query_text)
+            print(f"[text_vec][EXAMPLE] {idx}: {text_vec}")
+
             image_vec = embed_image(image_path)
-            object_vec = embed_objects(image_path)
+            print(f"[image_vec][EXAMPLE] {idx}: {image_vec}")
+
+            object_labels_en = filter_detected_labels_by_intent(detect_objects(image_path, text_queries=get_question_guided_owl_queries(item)), item)
+            object_labels_vi = translate_detected_labels_to_vi(object_labels_en)
+            object_vec = embed_objects(image_path, item=item, labels=object_labels_vi)
+            print(f"[object_vec][EXAMPLE] {idx}: {object_vec}")
 
             payload = {
                 "kind": "qa_example",
@@ -848,20 +1725,304 @@ def index_examples(client: QdrantClient, dataset: QaDataset) -> None:
                 "relevant_articles": item.get("relevant_articles", []),
             }
 
-            points.append(
-                PointStruct(
-                    id=idx,
-                    vector={"text": text_vec, "image": image_vec, "objects": object_vec},
-                    payload=payload,
-                )
+            point = PointStruct(
+                id=idx,
+                vector={
+                    "text": text_vec,
+                    "image": image_vec,
+                    "objects": object_vec,
+                },
+                payload=payload,
             )
+
+            client.upsert(
+                collection_name=config.collection_examples,
+                points=[point],
+            )
+
+            success_count += 1
+            print(f"[OK][INDEX_EXAMPLE] idx={idx} id={item.get('id')} upserted")
+
         except Exception as e:
+            fail_count += 1
             print(f"[ERROR][INDEX_EXAMPLE] idx={idx} id={item.get('id')} error={e}")
 
-    if points:
-        print(f"[INFO][EXAMPLE] Upserting {len(points)} example points...")
-        client.upsert(collection_name=config.collection_examples, points=points)
-        print(f"[OK][EXAMPLE] Indexed {len(points)} examples")
+    print(
+        f"[DONE][EXAMPLE] Indexed success={success_count} | failed={fail_count}"
+    )
+
+
+def normalize_vi_text(s: str) -> str:
+    s = str(s or "").lower().strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def unique_keep_order(items: Iterable[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for x in items:
+        if not x:
+            continue
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def extract_sign_codes_from_text(text: str) -> List[str]:
+    if not text:
+        return []
+    codes = re.findall(r"\b([A-Z]\.\d{1,3}[a-z]?)\b", text)
+    return unique_keep_order(codes)
+
+
+def infer_base_intents(text_norm: str) -> List[str]:
+    intents: List[str] = []
+
+    rules = [
+        ("cấm dừng xe và đỗ xe", "no_stopping_no_parking"),
+        ("cấm đỗ xe", "no_parking"),
+        ("nơi đỗ xe", "parking_place"),
+        ("chú ý xe đỗ", "watch_parked_vehicle"),
+        ("đường cấm", "no_entry"),
+        ("cấm đi ngược chiều", "no_wrong_way"),
+        ("rẽ trái", "turn_left"),
+        ("rẽ phải", "turn_right"),
+        ("đi thẳng", "go_straight"),
+        ("quay đầu xe", "u_turn"),
+        ("cấm quay đầu xe", "no_u_turn"),
+        ("tốc độ tối đa", "max_speed"),
+        ("tốc độ tối thiểu", "min_speed"),
+        ("nhường đường", "yield"),
+        ("dừng lại", "stop"),
+        ("đường ưu tiên", "priority_road"),
+        ("hết đường ưu tiên", "end_priority_road"),
+        ("cấm ô tô", "no_car"),
+        ("cấm xe mô tô", "no_motorcycle"),
+        ("cấm xe tải", "no_truck"),
+        ("cấm xe khách", "no_bus"),
+        ("cấm người đi bộ", "no_pedestrian"),
+    ]
+
+    for phrase, label in rules:
+        if phrase in text_norm:
+            intents.append(label)
+
+    return unique_keep_order(intents)
+
+
+def infer_entities(text_norm: str) -> Dict[str, List[str]]:
+    applies_to: List[str] = []
+
+    mapping = [
+        ("xe cơ giới", "motor_vehicle"),
+        ("ô tô", "car"),
+        ("xe tải", "truck"),
+        ("xe khách", "bus"),
+        ("xe mô tô", "motorcycle"),
+        ("người đi bộ", "pedestrian"),
+        ("xe ưu tiên", "priority_vehicle"),
+        ("xe thô sơ", "non_motor_vehicle"),
+    ]
+
+    for phrase, label in mapping:
+        if phrase in text_norm:
+            applies_to.append(label)
+
+    return {
+        "applies_to": unique_keep_order(applies_to)
+    }
+
+
+def infer_global_constraints(text_norm: str) -> Dict[str, Any]:
+    constraints: Dict[str, Any] = {}
+
+    has_odd = "ngày lẻ" in text_norm
+    has_even = "ngày chẵn" in text_norm
+
+    if has_odd and not has_even:
+        constraints["day_parity"] = ["odd"]
+    elif has_even and not has_odd:
+        constraints["day_parity"] = ["even"]
+    elif has_odd and has_even:
+        constraints["day_parity"] = ["odd", "even"]
+
+    side_values: List[str] = []
+    if "bên trái" in text_norm:
+        side_values.append("left")
+    if "bên phải" in text_norm:
+        side_values.append("right")
+    if "phía đường có đặt biển" in text_norm:
+        side_values.append("same_side_as_sign")
+    if side_values:
+        constraints["applies_side"] = unique_keep_order(side_values)
+
+    scope_values: List[str] = []
+    if "trong khu vực" in text_norm:
+        scope_values.append("zone")
+    if "trên đoạn đường" in text_norm:
+        scope_values.append("road_segment")
+    if "giao nhau" in text_norm or "ngã ba" in text_norm or "ngã tư" in text_norm:
+        scope_values.append("intersection")
+    if scope_values:
+        constraints["scope_type"] = unique_keep_order(scope_values)
+
+    return constraints
+
+
+def split_variant_sentences(text: str) -> Dict[str, str]:
+    if not text:
+        return {}
+
+    raw = re.sub(r"\s+", " ", text)
+    matches = list(re.finditer(r"\b([A-Z]\.\d{1,3}[a-z])\b", raw))
+    if not matches:
+        return {}
+
+    out: Dict[str, str] = {}
+    for i, m in enumerate(matches):
+        code = m.group(1)
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+        chunk = raw[start:end].strip(" ;,.")
+        out[code] = chunk
+
+    return out
+
+
+def infer_variant_constraints_from_text(code: str, variant_text_norm: str) -> Dict[str, Any]:
+    constraints: Dict[str, Any] = {}
+
+    if "ngày lẻ" in variant_text_norm:
+        constraints["day_parity"] = "odd"
+    elif "ngày chẵn" in variant_text_norm:
+        constraints["day_parity"] = "even"
+
+    if "bên trái" in variant_text_norm:
+        constraints["applies_side"] = "left"
+    elif "bên phải" in variant_text_norm:
+        constraints["applies_side"] = "right"
+    elif "phía đường có đặt biển" in variant_text_norm:
+        constraints["applies_side"] = "same_side_as_sign"
+
+    if "trái" in variant_text_norm and "phải" not in variant_text_norm:
+        constraints.setdefault("direction", "left")
+    elif "phải" in variant_text_norm and "trái" not in variant_text_norm:
+        constraints.setdefault("direction", "right")
+    elif "đi thẳng" in variant_text_norm:
+        constraints.setdefault("direction", "straight")
+
+    return constraints
+
+
+def build_variants(sign_codes: List[str], title: str, text: str) -> List[Dict[str, Any]]:
+    full = f"{title}\n{text}"
+    full_norm = normalize_vi_text(full)
+    variant_chunks = split_variant_sentences(full)
+
+    variants: List[Dict[str, Any]] = []
+
+    for code in sign_codes:
+        constraints: Dict[str, Any] = {}
+        code_norm = code.lower()
+
+        chunk = variant_chunks.get(code, "")
+        chunk_norm = normalize_vi_text(chunk)
+
+        if chunk_norm:
+            constraints.update(infer_variant_constraints_from_text(code, chunk_norm))
+        else:
+            if code_norm.endswith("b") and "ngày lẻ" in full_norm and "ngày chẵn" not in full_norm:
+                constraints["day_parity"] = "odd"
+            elif code_norm.endswith("c") and "ngày chẵn" in full_norm and "ngày lẻ" not in full_norm:
+                constraints["day_parity"] = "even"
+
+        variants.append(
+            {
+                "variant_id": code,
+                "constraints": constraints,
+                "text": chunk if chunk else None,
+            }
+        )
+
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for v in variants:
+        vid = v["variant_id"]
+        if vid in seen:
+            continue
+        seen.add(vid)
+        deduped.append(v)
+
+    return deduped
+
+
+def build_law_semantics(item: Dict[str, Any]) -> Dict[str, Any]:
+    law_title = str(item.get("law_title", "") or "")
+    title = str(item.get("title", "") or "")
+    text = str(item.get("text", "") or "")
+    full_text = str(item.get("full_text", "") or "")
+
+    full = "\n".join([x for x in [law_title, title, text, full_text] if x])
+    text_norm = normalize_vi_text(full)
+
+    raw_codes = list(item.get("sign_codes", []) or [])
+    extracted_codes = extract_sign_codes_from_text(full)
+    sign_codes = unique_keep_order(raw_codes + extracted_codes)
+
+    semantics = {
+        "base_intents": infer_base_intents(text_norm),
+        "global_constraints": infer_global_constraints(text_norm),
+        "variants": build_variants(sign_codes, title=title, text=full_text or text),
+        "sign_codes": sign_codes,
+        "applies_to": infer_entities(text_norm).get("applies_to", []),
+    }
+    return semantics
+
+
+def truncate_for_embedding(text: str, max_chars: int = 3500) -> str:
+    text = str(text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars]
+
+def build_law_embedding_text(item: Dict[str, Any], semantics: Dict[str, Any]) -> str:
+    law_id = str(item.get("law_id", "") or "")
+    article_id = str(item.get("article_id", "") or "")
+    law_title = str(item.get("law_title", "") or "")
+    title = str(item.get("title", "") or "")
+    text = str(item.get("text", "") or "")
+    full_text = str(item.get("full_text", "") or "")
+
+    sign_codes = ", ".join(semantics.get("sign_codes", []))
+    base_intents = ", ".join(semantics.get("base_intents", []))
+    applies_to = ", ".join(semantics.get("applies_to", []))
+
+    variant_lines: List[str] = []
+    for variant in semantics.get("variants", []):
+        vid = variant.get("variant_id", "")
+        constraints = variant.get("constraints", {}) or {}
+        if constraints:
+            constraint_str = ", ".join(f"{k}={v}" for k, v in constraints.items())
+            variant_lines.append(f"{vid}: {constraint_str}")
+        else:
+            variant_lines.append(str(vid))
+
+    variants_text = " | ".join(variant_lines)
+
+    parts = [
+        f"Law: {law_id}",
+        f"Article: {article_id}",
+        f"Law title: {law_title}",
+        f"Article title: {title}",
+        f"Sign codes: {sign_codes}",
+        f"Base intents: {base_intents}",
+        f"Applies to: {applies_to}",
+        f"Variants: {variants_text}",
+        f"Text: {full_text or text}",
+    ]
+    return "\n".join([p for p in parts if p.strip()])
 
 
 def index_laws(client: QdrantClient, dataset: LawDataset) -> None:
@@ -877,23 +2038,31 @@ def index_laws(client: QdrantClient, dataset: LawDataset) -> None:
 
         try:
             text = str(item.get("text", "")).strip() or "[EMPTY]"
-            text_vec = embed_text_passage(text)
-
             full_text = str(item.get("full_text", "")).strip()
-            payload_text = full_text[:4000] if len(full_text) > 4000 else full_text
+            law_title = str(item.get("law_title", "")).strip()
+            title = str(item.get("title", "")).strip()
+
+            semantics = build_law_semantics(item)
+            embedding_text = truncate_for_embedding(build_law_embedding_text(item, semantics), 3500)
+            text_vec = embed_text_passage(embedding_text)
+
+            payload_text = full_text#[:4000] if len(full_text) > 4000 else full_text
+            if not payload_text:
+                payload_text = text#[:4000] if len(text) > 4000 else text
 
             payload = {
                 "kind": "law_article",
                 "id": item.get("id"),
-                "law_id": item.get("law_id"),
-                "article_id": item.get("article_id"),
-                "full_id": item.get("full_id"),
-                "law_title": item.get("law_title"),
-                "title": item.get("title"),
+                "law_id": law_id,
+                "article_id": article_id,
+                "full_id": full_id,
+                "law_title": law_title,
+                "title": title,
                 "text": payload_text,
                 "full_text": payload_text,
-                "sign_codes": item.get("sign_codes", []),
+                "sign_codes": semantics.get("sign_codes", []),
                 "image_id": item.get("image_id"),
+                "semantics": semantics,
             }
 
             points.append(
@@ -907,6 +2076,32 @@ def index_laws(client: QdrantClient, dataset: LawDataset) -> None:
                     payload=payload,
                 )
             )
+
+            print("\n" + "-" * 80)
+            print(f"[DEBUG][LAW] {law_id}::{article_id}")
+
+            print(f"[TITLE] {title}")
+            print(f"[LAW TITLE] {law_title}")
+
+            print(f"[TEXT SAMPLE]")
+            print((full_text or text)[:500])
+
+            print(f"[SIGN_CODES RAW] {item.get('sign_codes', [])}")
+
+            print(f"[SEMANTICS]")
+            print(f"  article_type={semantics.get('article_type')}")
+            print(f"  base_intents={semantics.get('base_intents')}")
+            print(f"  global_constraints={semantics.get('global_constraints')}")
+            print(f"  applies_to={semantics.get('applies_to')}")
+            print(f"  sign_codes={semantics.get('sign_codes')}")
+
+            print(f"[VARIANTS]")
+            for v in semantics.get("variants", []):
+                print(f"  - {v}")
+
+            print("-" * 80 + "\n")
+
+
         except Exception as e:
             print("\n" + "=" * 90)
             print(f"[ERROR][LAW] idx={idx}")
@@ -922,8 +2117,6 @@ def index_laws(client: QdrantClient, dataset: LawDataset) -> None:
         print(f"[OK][LAW] Indexed {len(points)} law articles")
 
     print(f"[SUMMARY][LAW] Total indexing errors: {error_count}")
-
-
 # =========================================================
 # Retrieval
 # =========================================================
@@ -932,6 +2125,7 @@ def retrieve_examples_and_laws(
     item: Dict[str, Any],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
     image_path = get_qa_image_path(config.test_image_dir, item)
+    question_intent = parse_question_intent(item)
     text_vec = embed_text_query(build_query_text(item))
 
     if len(text_vec) != TEXT_DIM:
@@ -940,20 +2134,31 @@ def retrieve_examples_and_laws(
         )
 
     has_image = bool(image_path and os.path.exists(image_path))
-    image_vec = embed_image(image_path) if has_image else zero_vec(IMAGE_DIM)
-    object_vec = embed_objects(image_path) if has_image else zero_vec(OBJECT_DIM)
-    image_desc = build_image_description(image_path) if has_image else "Không tìm thấy ảnh để phân tích."
+    guided_queries = get_question_guided_owl_queries(item)
+    raw_detected_labels = detect_objects(image_path, text_queries=guided_queries) if has_image else []
+    filtered_labels = filter_detected_labels_by_intent(raw_detected_labels, item) if has_image else []
+    filtered_labels_vi = translate_detected_labels_to_vi(filtered_labels) if has_image else []
 
-    # Example retrieval uses all three modalities.
+    image_vec = embed_image(image_path) if has_image else zero_vec(IMAGE_DIM)
+    object_vec = embed_objects(image_path, item=item, labels=filtered_labels_vi) if has_image else zero_vec(OBJECT_DIM)
+    image_desc = build_image_description(image_path, item=item, labels=filtered_labels_vi) if has_image else "Không tìm thấy ảnh để phân tích."
+
+    example_weights = (0.70, 0.20, 0.10)
+    if filtered_labels_vi:
+        example_weights = (0.60, 0.20, 0.20)
+        if question_intent.get("topic") == "parking_restriction":
+            example_weights = (0.55, 0.15, 0.30)
+        elif question_intent.get("topic") == "lane_assignment":
+            example_weights = (0.60, 0.15, 0.25)
+
     example_hits = fuse_hits(
         search_named_vector(client, config.collection_examples, "text", text_vec, config.top_k_examples * 3),
         search_named_vector(client, config.collection_examples, "image", image_vec, config.top_k_examples * 3),
         search_named_vector(client, config.collection_examples, "objects", object_vec, config.top_k_examples * 3),
         config.top_k_examples,
-        weights=(0.60, 0.25, 0.15),
+        weights=example_weights,
     )
 
-    # Law retrieval currently relies on text retrieval, then reranks using choices.
     raw_law_hits = fuse_hits(
         search_named_vector(client, config.collection_law, "text", text_vec, config.top_k_laws * 8),
         [],
@@ -969,8 +2174,14 @@ def retrieve_examples_and_laws(
         print(f"[DEBUG][RETRIEVE] QUERY ID: {item.get('id')}")
         print(f"[DEBUG][RETRIEVE] QUESTION: {item.get('question', '')}")
         print(f"[DEBUG][RETRIEVE] QUESTION TYPE: {item.get('question_type', '')}")
+        print(f"[DEBUG][RETRIEVE] QUESTION INTENT: {question_intent}")
         print(f"[DEBUG][RETRIEVE] IMAGE PATH: {image_path}")
         print(f"[DEBUG][RETRIEVE] HAS IMAGE: {has_image}")
+        print(f"[DEBUG][RETRIEVE] GUIDED OWL QUERIES: {guided_queries}")
+        print(f"[DEBUG][RETRIEVE] RAW DETECTED LABELS: {raw_detected_labels}")
+        print(f"[DEBUG][RETRIEVE] FILTERED LABELS EN: {filtered_labels}")
+        print(f"[DEBUG][RETRIEVE] FILTERED LABELS VI: {filtered_labels_vi}")
+        print(f"[DEBUG][RETRIEVE] EXAMPLE FUSION WEIGHTS: {example_weights}")
         print(f"[DEBUG][RETRIEVE] IMAGE DESCRIPTION: {image_desc}")
         print(f"[DEBUG][RETRIEVE] GOLD ARTICLES: {item.get('relevant_articles', [])}")
 
@@ -990,9 +2201,16 @@ def retrieve_examples_and_laws(
                 f"boost={hit.get('choice_boost', 0.0):.6f} "
                 f"id={p.get('full_id')} title={compact_text(p.get('title', ''), 120)}"
             )
-            print(f"     matched_choices={dbg.get('matched_choices', [])}")
-            print(f"     matched_phrases={dbg.get('matched_phrases', [])}")
-            print(f"     sign_codes={dbg.get('sign_codes', [])}")
+            if is_yes_no_question(item.get("question_type", "")):
+                print(f"     matched_terms={dbg.get('matched_terms', [])}")
+                print(f"     support_true={dbg.get('support_true', 0.0)}")
+                print(f"     support_false={dbg.get('support_false', 0.0)}")
+                print(f"     predicted_label={dbg.get('predicted_label')}")
+                print(f"     sign_codes={dbg.get('sign_codes', [])}")
+            else:
+                print(f"     matched_choices={dbg.get('matched_choices', [])}")
+                print(f"     matched_phrases={dbg.get('matched_phrases', [])}")
+                print(f"     sign_codes={dbg.get('sign_codes', [])}")
 
         print("[DEBUG][RETRIEVE] TOP EXAMPLE HITS:")
         for i, hit in enumerate(example_hits[:5], 1):
@@ -1035,17 +2253,67 @@ def build_prompt(
             return "; ".join([p for p in parts if p])
         return str(x).strip()
 
+    def summarize_visual_cues(desc: str) -> List[str]:
+        d = normalize_vi_text(desc)
+        cues: List[str] = []
+
+        priority_rules = [
+            ("biển ngày chẵn", "Có dấu hiệu ngày chẵn"),
+            ("biển ngày lẻ", "Có dấu hiệu ngày lẻ"),
+            ("biển cấm dừng xe và đỗ xe", "Có dấu hiệu cấm dừng xe và đỗ xe"),
+            ("biển cấm đỗ xe", "Có dấu hiệu cấm đỗ xe"),
+            ("vạch chéo đỏ", "Có vạch chéo đỏ"),
+            ("biển tròn xanh", "Có biển tròn xanh"),
+            ("mũi tên", "Có mũi tên chỉ hướng"),
+            ("làn dành cho ô tô", "Có dấu hiệu làn dành cho ô tô"),
+            ("làn dành cho xe buýt", "Có dấu hiệu làn dành cho xe buýt"),
+            ("làn dành cho xe mô tô", "Có dấu hiệu làn dành cho xe mô tô"),
+        ]
+
+        for key, msg in priority_rules:
+            if key in d:
+                cues.append(msg)
+
+        return cues[:4]
+
+    def extract_variant_hints(retrieved_laws: List[Dict[str, Any]]) -> List[str]:
+        hints: List[str] = []
+
+        for hit in retrieved_laws[:3]:
+            p = hit.get("payload", {})
+            text = str(p.get("text", "") or p.get("full_text", ""))
+            text_norm = normalize_vi_text(text)
+            title = str(p.get("title", "")).strip()
+
+            if "p.131" in normalize_vi_text(title) or "cấm đỗ xe" in normalize_vi_text(title):
+                if "ngày lẻ" in text_norm and "ngày chẵn" in text_norm:
+                    hints.append("Trong luật nhóm biển P.131, biến thể ngày lẻ/ngày chẵn là các biến thể khác nhau, không được gộp chung.")
+                if "p.131b" in text_norm and "ngày lẻ" in text_norm:
+                    hints.append("P.131b tương ứng cấm đỗ xe vào ngày lẻ.")
+                if "p.131c" in text_norm and "ngày chẵn" in text_norm:
+                    hints.append("P.131c tương ứng cấm đỗ xe vào ngày chẵn.")
+
+        seen = set()
+        out = []
+        for h in hints:
+            if h not in seen:
+                seen.add(h)
+                out.append(h)
+        return out[:4]
+
     question = str(item.get("question", "")).strip()
     qtype = str(item.get("question_type", "")).strip()
     choices = normalize_choices(item.get("choices", []))
     yes_no = is_yes_no_question(qtype)
+    visual_cues = summarize_visual_cues(image_description)
+    variant_hints = extract_variant_hints(retrieved_laws)
 
     lines: List[str] = []
     lines.append("Bạn là trợ lý giải bài MLQA-TSR về luật giao thông Việt Nam.")
-    lines.append("Ưu tiên bám sát điều luật được cung cấp. Ví dụ truy hồi chỉ để tham khảo phụ trợ.")
+    lines.append("Ưu tiên tuyệt đối điều luật và đặc trưng trực quan then chốt của ảnh.")
     lines.append(
-        "Nếu điều luật mô tả một nhóm biển có nhiều biến thể (ví dụ a/b/c), phải chọn đúng biến thể khớp nhất với lựa chọn; "
-        "không chọn tên gọi chung nếu lựa chọn yêu cầu mức chi tiết hơn."
+        "Nếu luật mô tả một nhóm biển có nhiều biến thể (a/b/c...), phải chọn đúng biến thể cụ thể; "
+        "không được chọn tên gọi chung nếu đáp án có phương án chi tiết hơn."
     )
 
     if yes_no:
@@ -1053,13 +2321,23 @@ def build_prompt(
         lines.append("Chỉ trả lời bằng đúng một từ: ĐÚNG hoặc SAI.")
     else:
         lines.append("Nhiệm vụ: chọn đúng một đáp án trong các lựa chọn.")
-        lines.append(
-            "Phải phân biệt kỹ các lựa chọn gần nghĩa như: cấm dừng/đỗ, ngày chẵn/ngày lẻ, nơi đỗ xe/chú ý xe đỗ."
-        )
         lines.append("Chỉ trả lời bằng đúng một chữ cái: A, B, C hoặc D.")
+        lines.append(
+            "Quy tắc bắt buộc: nếu ảnh có tín hiệu đặc thù như 'ngày chẵn' hoặc 'ngày lẻ', "
+            "phải ưu tiên đáp án chi tiết tương ứng, không chọn đáp án tổng quát."
+        )
 
-    lines.append("\n# BIỂN BÁO / ẢNH")
-    lines.append(image_description)
+    lines.append("\n# DẤU HIỆU TRỰC QUAN CHÍNH")
+    if visual_cues:
+        for cue in visual_cues:
+            lines.append(f"- {cue}")
+    else:
+        lines.append(f"- {image_description}")
+
+    if variant_hints:
+        lines.append("\n# GỢI Ý BIẾN THỂ QUAN TRỌNG")
+        for hint in variant_hints:
+            lines.append(f"- {hint}")
 
     if retrieved_laws:
         lines.append("\n# ĐIỀU LUẬT THAM KHẢO")
@@ -1068,19 +2346,22 @@ def build_prompt(
             title = str(p.get("title", "")).strip()
             law_id = str(p.get("law_id", "")).strip()
             article_id = str(p.get("article_id", "")).strip()
-            text = compact_text(p.get("text", "") or p.get("full_text", ""), 1200)
+            text = compact_text(p.get("text", "") or p.get("full_text", ""), 900)
             meta = " | ".join([x for x in [law_id, article_id, title] if x])
+
             lines.append(f"[LAW {i}] {meta}")
             if text:
                 lines.append(text)
+
             dbg = hit.get("debug", {})
-            if dbg.get("matched_phrases"):
-                lines.append(f"Gợi ý khớp lựa chọn: {', '.join(dbg.get('matched_phrases', []))}")
+            matched_phrases = dbg.get("matched_phrases", []) or []
+            if matched_phrases:
+                lines.append(f"Gợi ý khớp lựa chọn: {', '.join(matched_phrases[:5])}")
             lines.append("")
 
     if retrieved_examples:
         lines.append("\n# VÍ DỤ THAM KHẢO")
-        for i, hit in enumerate(retrieved_examples[:3], 1):
+        for i, hit in enumerate(retrieved_examples[:2], 1):
             p = hit.get("payload", {})
             ex_question = str(p.get("question", "")).strip()
             ex_qtype = str(p.get("question_type", "")).strip()
@@ -1114,10 +2395,12 @@ def build_prompt(
             lines.append("Lựa chọn:")
             lines.append(choice_text)
 
-        lines.append("\n# YÊU CẦU SUY LUẬN NGẦM")
-        lines.append("- Đối chiếu từng lựa chọn với điều luật.")
-        lines.append("- Nếu có lựa chọn tổng quát và lựa chọn cụ thể hơn, ưu tiên lựa chọn cụ thể đúng với mô tả luật.")
-        lines.append("- Đặc biệt chú ý các khác biệt: 'cấm đỗ xe' vs 'cấm đỗ xe ngày lẻ/ngày chẵn', 'cấm dừng xe và đỗ xe' vs 'cấm đỗ xe'.")
+    lines.append("\n# QUY TẮC SUY LUẬN BẮT BUỘC")
+    lines.append("- Đối chiếu từng lựa chọn với điều luật.")
+    lines.append("- Nếu có đáp án tổng quát và đáp án cụ thể hơn, ưu tiên đáp án cụ thể đúng với đặc trưng ảnh.")
+    lines.append("- Nếu có dấu hiệu 'ngày chẵn', không chọn đáp án 'Cấm' chung chung.")
+    lines.append("- Nếu có dấu hiệu 'ngày lẻ', không chọn đáp án 'Cấm' chung chung.")
+    lines.append("- Chỉ chọn đáp án tổng quát khi không có dấu hiệu nào đủ để xác định biến thể cụ thể.")
 
     lines.append("\n# OUTPUT")
     if yes_no:
@@ -1132,11 +2415,6 @@ def build_prompt(
 # LLM call / output extraction
 # =========================================================
 def extract_choice(text: str, question_type: str = "") -> str:
-    """
-    Normalize model output:
-    - Multiple choice -> A/B/C/D
-    - Yes/No -> ĐÚNG/SAI
-    """
     raw = str(text or "").strip()
     upper = raw.upper()
     yes_no = is_yes_no_question(question_type)
@@ -1157,11 +2435,6 @@ def extract_choice(text: str, question_type: str = "") -> str:
 
 
 def call_llm(prompt: str, question_type: str = "") -> Tuple[str, str]:
-    """
-    Call local Ollama and return:
-    - normalized prediction
-    - raw model output for debugging
-    """
     payload = {
         "model": config.ollama_model,
         "prompt": prompt,
@@ -1200,34 +2473,233 @@ def call_llm(prompt: str, question_type: str = "") -> Tuple[str, str]:
         return fallback, ""
 
 
+def compute_rule_confidence(
+    item: Dict[str, Any],
+    rule_prediction: Optional[str],
+    rule_debug: Dict[str, Any],
+    retrieved_laws: List[Dict[str, Any]],
+) -> float:
+    if not rule_prediction:
+        return 0.0
+
+    debug = rule_debug or {}
+    reason = str(debug.get("reason", "") or "")
+    if reason in {"not_applicable", "no_force", "no_choice_scores", "weak_gap"}:
+        return 0.0
+
+    conf = 0.0
+    yes_no = is_yes_no_question(item.get("question_type", ""))
+
+    if yes_no:
+        support_true = float(debug.get("support_true", 0.0) or 0.0)
+        support_false = float(debug.get("support_false", 0.0) or 0.0)
+        support_gap = abs(support_true - support_false)
+        conf += min(support_gap / 0.50, 1.0) * 0.60
+        conf += min(max(support_true, support_false) / 0.60, 1.0) * 0.25
+
+        matched_terms = 0
+        overlap_sum = 0.0
+        sign_code_hits = 0
+        for hit in retrieved_laws[:3]:
+            dbg = hit.get("debug", {}) or {}
+            matched_terms += len(dbg.get("matched_terms", []) or [])
+            overlap_sum += float(dbg.get("overlap_score", 0.0) or 0.0)
+            sign_code_hits += len(dbg.get("sign_codes", []) or [])
+
+        conf += min(matched_terms / 3.0, 1.0) * 0.10
+        conf += min(overlap_sum / 0.50, 1.0) * 0.05
+        conf += min(sign_code_hits / 2.0, 1.0) * 0.05
+    else:
+        ranked = debug.get("ranked_choice_scores", []) or []
+        choice_scores = debug.get("choice_scores", {}) or {}
+        best_score = float(ranked[0][1] if ranked else 0.0)
+        second_score = float(ranked[1][1] if len(ranked) > 1 else 0.0)
+        choice_gap = float(debug.get("choice_gap", best_score - second_score) or 0.0)
+        top_gap = float(debug.get("top_gap", 0.0) or 0.0)
+        exact_title_match = bool(debug.get("exact_title_match", False))
+
+        conf += min(best_score / 1.50, 1.0) * 0.35
+        conf += min(max(choice_gap, 0.0) / 0.50, 1.0) * 0.30
+        conf += min(max(top_gap, 0.0) / 0.20, 1.0) * 0.15
+        conf += min(len(choice_scores) / 4.0, 1.0) * 0.05
+
+        if exact_title_match:
+            conf += 0.15
+
+        if reason == "exact_title_match":
+            conf += 0.10
+        elif reason == "strong_choice_score_gap":
+            conf += 0.08
+        elif reason == "single_matched_choice":
+            conf += 0.05
+
+    return max(0.0, min(conf, 1.0))
+
+
+def compute_llm_confidence(
+    item: Dict[str, Any],
+    llm_prediction: Optional[str],
+    raw_output: str,
+    retrieved_laws: List[Dict[str, Any]],
+) -> float:
+    if not llm_prediction:
+        return 0.0
+
+    conf = 0.35
+    raw = str(raw_output or "").strip()
+    yes_no = is_yes_no_question(item.get("question_type", ""))
+
+    valid_labels = {"ĐÚNG", "SAI"} if yes_no else set(build_choice_map(item).keys()) or {"A", "B", "C", "D"}
+    if llm_prediction in valid_labels:
+        conf += 0.15
+
+    if raw:
+        upper = raw.upper().strip()
+        if upper in {"A", "B", "C", "D", "ĐÚNG", "SAI", "DUNG"}:
+            conf += 0.20
+        elif len(raw) <= 12:
+            conf += 0.12
+        elif len(raw) <= 64:
+            conf += 0.06
+    else:
+        conf -= 0.20
+
+    if retrieved_laws:
+        top_score = float(retrieved_laws[0].get("score", 0.0) or 0.0)
+        second_score = float(retrieved_laws[1].get("score", 0.0) or 0.0) if len(retrieved_laws) > 1 else 0.0
+        conf += min(top_score / 1.0, 1.0) * 0.15
+        conf += min(max(top_score - second_score, 0.0) / 0.15, 1.0) * 0.05
+
+    if yes_no and any(tok in raw.upper() for tok in ["ĐÚNG", "SAI", "TRUE", "FALSE"]):
+        conf += 0.05
+
+    return max(0.0, min(conf, 1.0))
+
+
+def fuse_predictions(
+    item: Dict[str, Any],
+    rule_prediction: Optional[str],
+    llm_prediction: Optional[str],
+    rule_confidence: float,
+    llm_confidence: float,
+) -> Tuple[str, str, Dict[str, float], float]:
+    yes_no = is_yes_no_question(item.get("question_type", ""))
+    if yes_no:
+        labels = ["ĐÚNG", "SAI"]
+        fallback = "SAI"
+    else:
+        choice_map = build_choice_map(item)
+        labels = list(choice_map.keys()) or ["A", "B", "C", "D"]
+        fallback = labels[0]
+
+    scores = {label: 0.0 for label in labels}
+
+    if rule_prediction in scores and rule_confidence > 0.0:
+        scores[rule_prediction] += rule_confidence
+
+    if llm_prediction in scores and llm_confidence > 0.0:
+        scores[llm_prediction] += llm_confidence
+
+    if rule_prediction and llm_prediction and rule_prediction == llm_prediction and rule_prediction in scores:
+        scores[rule_prediction] += 0.05
+
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    best_label, best_score = ranked[0] if ranked else (fallback, 0.0)
+    second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+    margin = best_score - second_score
+
+    decision_source = "llm"
+    if rule_prediction and rule_confidence >= 0.80 and llm_confidence <0.90:
+        best_label = rule_prediction
+        decision_source = "rule_strong"
+    elif rule_prediction and llm_prediction and rule_prediction == llm_prediction and rule_confidence >= 0.50:
+        best_label = rule_prediction
+        decision_source = "rule_llm_agree"
+    elif best_score > 0.0:
+        if rule_prediction == best_label and rule_confidence > llm_confidence:
+            decision_source = "fusion_rule"
+        elif llm_prediction == best_label:
+            decision_source = "fusion_llm"
+        else:
+            decision_source = "fusion"
+    elif llm_prediction:
+        best_label = llm_prediction
+        decision_source = "llm_fallback"
+    elif rule_prediction:
+        best_label = rule_prediction
+        decision_source = "rule_fallback"
+    else:
+        best_label = fallback
+        decision_source = "default_fallback"
+
+    return best_label, decision_source, scores, margin
+
+
 # =========================================================
 # Evaluation run
 # =========================================================
 def run_eval(client: QdrantClient, dataset: QaDataset) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
 
-    for idx, item in enumerate(dataset, 1):
-        print("=" * 100)
-        print(f"[EVAL] {idx}/{len(dataset.items)} | id={item.get('id')} | image_id={item.get('image_id')}")
+    with open(config.output_file, "w", encoding="utf-8") as f:
+        f.write("[\n")
 
-        retrieved_examples, retrieved_laws, image_description = retrieve_examples_and_laws(client, item)
-        prompt = build_prompt(item, retrieved_examples, retrieved_laws, image_description)
-        prediction, raw_output = call_llm(prompt, question_type=item.get("question_type", ""))
+        for idx, item in enumerate(dataset, 1):
+            print("=" * 100)
+            print(f"[EVAL] {idx}/{len(dataset.items)} | id={item.get('id')} | image_id={item.get('image_id')}")
 
-        if config.debug_retrieval:
-            print(f"[DEBUG][PROMPT]\n{compact_text(prompt, 2500)}")
+            retrieved_examples, retrieved_laws, image_description = retrieve_examples_and_laws(client, item)
+            item["image_description"] = image_description
+            rule_prediction, rule_debug = choose_by_law_priority(item, retrieved_laws)
+            prompt = build_prompt(item, retrieved_examples, retrieved_laws, image_description)
+            llm_prediction, raw_output = call_llm(prompt, question_type=item.get("question_type", ""))
 
-        results.append(
-            {
+            rule_confidence = compute_rule_confidence(
+                item=item,
+                rule_prediction=rule_prediction,
+                rule_debug=rule_debug,
+                retrieved_laws=retrieved_laws,
+            )
+            llm_confidence = compute_llm_confidence(
+                item=item,
+                llm_prediction=llm_prediction,
+                raw_output=raw_output,
+                retrieved_laws=retrieved_laws,
+            )
+            prediction, decision_source, fused_scores, fused_margin = fuse_predictions(
+                item=item,
+                rule_prediction=rule_prediction,
+                llm_prediction=llm_prediction,
+                rule_confidence=rule_confidence,
+                llm_confidence=llm_confidence,
+            )
+
+            if config.debug_retrieval:
+                print(f"[DEBUG][PROMPT]\n{prompt}")
+                print(
+                    f"[DEBUG][DECISION] rule_prediction={rule_prediction} | llm_prediction={llm_prediction} | "
+                    f"rule_conf={rule_confidence:.4f} | llm_conf={llm_confidence:.4f} | "
+                    f"final={prediction} | source={decision_source} | margin={fused_margin:.4f}"
+                )
+                print(f"[DEBUG][DECISION] fused_scores={fused_scores}")
+                print(f"[DEBUG][DECISION] rule_debug={rule_debug}")
+
+            result = {
                 "id": item.get("id"),
                 "image_id": item.get("image_id"),
                 "question_type": item.get("question_type"),
                 "prediction": prediction,
+                "llm_prediction": llm_prediction,
+                "rule_prediction": rule_prediction,
+                "decision_source": decision_source,
+                "rule_confidence": round(rule_confidence, 6),
+                "llm_confidence": round(llm_confidence, 6),
+                "fused_scores": {k: round(v, 6) for k, v in fused_scores.items()},
+                "fused_margin": round(fused_margin, 6),
+                "rule_debug": rule_debug,
                 "llm_raw_output": raw_output,
                 "retrieved_example_ids": [x["payload"].get("id") for x in retrieved_examples],
-                "retrieved_law_ids": [
-                    x["payload"].get("article_id") or x["payload"].get("id") for x in retrieved_laws
-                ],
+                "retrieved_law_ids": [x["payload"].get("article_id") or x["payload"].get("id") for x in retrieved_laws],
                 "retrieved_laws": [
                     {
                         "id": x["payload"].get("id"),
@@ -1245,7 +2717,16 @@ def run_eval(client: QdrantClient, dataset: QaDataset) -> List[Dict[str, Any]]:
                 ],
                 "image_description": image_description,
             }
-        )
+
+            results.append(result)
+            json.dump(result, f, ensure_ascii=False)
+            if idx < len(dataset.items):
+                f.write(",\n")
+            else:
+                f.write("\n")
+            f.flush()
+
+        f.write("]\n")
 
     return results
 
@@ -1263,8 +2744,12 @@ def main() -> None:
     if config.use_image_models:
         print("[INFO] Loading C-RADIOv2...")
         CRADIO_MODEL = get_c_radio()
-        print("[INFO] Loading OWLv2...")
-        OWL_PROCESSOR, OWL_MODEL = get_owl()
+
+        if has_module("scipy"):
+            print("[INFO] Loading OWLv2...")
+            OWL_PROCESSOR, OWL_MODEL = get_owl()
+        else:
+            print("[WARN][OBJECT] scipy chưa được cài -> bỏ qua OWLv2 object detection. Cài bằng: pip install scipy")
     else:
         print("[INFO] Image models disabled -> image/object vectors will be zero or text-derived placeholders.")
 
@@ -1282,6 +2767,11 @@ def main() -> None:
     print(f"[INFO] Qdrant URL: {config.qdrant_url}")
     print(f"[INFO] Ollama base URL: {config.ollama_base_url}")
     print(f"[INFO] Ollama model: {config.ollama_model}")
+    print(f"[INFO] C-RADIO repo: {config.cradio_repo}")
+    print(f"[INFO] C-RADIO local dir: {config.cradio_local_dir}")
+    print(f"[INFO] OWLv2 repo: {config.owlv2_repo}")
+    print(f"[INFO] OWLv2 local dir: {config.owlv2_local_dir}")
+    print(f"[INFO] HF cache root: {HF_CACHE_ROOT}")
 
     if not collection_has_data(client, config.collection_examples):
         print("[INFO] Indexing examples...")
@@ -1297,12 +2787,7 @@ def main() -> None:
 
     print("[INFO] Running evaluation / prediction...")
     results = run_eval(client, eval_ds)
-
-    with open(config.output_file, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-
-    print(f"[DONE] Saved predictions to {config.output_file}")
-
+    print(f"[DONE] Saved predictions to {config.output_file} | total={len(results)}")
 
 if __name__ == "__main__":
     main()
