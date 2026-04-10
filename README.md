@@ -55,7 +55,7 @@ docker run -p 6333:6333 qdrant/qdrant
 
 ## V. Run
 
-python berry_pipeline.py
+python berry_pipeline_qwen.py
 
 ---
 
