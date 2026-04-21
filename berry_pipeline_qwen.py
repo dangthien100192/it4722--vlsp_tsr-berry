@@ -163,6 +163,7 @@ class Config:
 
     # LLM / Ollama
     ollama_base_url: str = "http://localhost:11434"
+    openai_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5:7b"
     llm_timeout: int = 300
     llm_temperature: float = 0.0
@@ -213,6 +214,7 @@ class Config:
             embed_url=os.getenv("EMBED_URL", "https://api.jina.ai/v1/embeddings"),
             embed_timeout=int(os.getenv("EMBED_TIMEOUT", "60")),
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+            openai_base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:11434"),
             ollama_model=os.getenv("OLLAMA_MODEL", "qwen2.5:7b"),
             llm_timeout=int(os.getenv("LLM_TIMEOUT", "300")),
             llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0")),
@@ -2447,7 +2449,8 @@ def call_llm(prompt: str, question_type: str = "") -> Tuple[str, str]:
 
     try:
         response = requests.post(
-            f"{config.ollama_base_url}/api/generate",
+            #f"{config.ollama_base_url}/api/generate", #Ollama
+            f"{config.openai_base_url}/v1/chat/completions", #OpenAI
             json=payload,
             timeout=config.llm_timeout,
         )
