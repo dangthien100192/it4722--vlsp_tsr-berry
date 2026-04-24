@@ -53,7 +53,7 @@ class Config:
             train_image_dir=os.getenv("TRAIN_IMAGE_DIR", "./dataset/train_images"),
             test_image_dir=os.getenv("TEST_IMAGE_DIR", "./dataset/public_test_images"),
             qdrant_url=os.getenv("QDRANT_URL", "http://localhost:6333"),
-            output_file=os.getenv("OUTPUT_FILE", "predictions.json"),
+            output_file=os.getenv("OUTPUT_FILE", "predictions.json.ollama"),
             jina_api_key=os.getenv("JINA_API_KEY", ""),
             law_json=os.getenv("LAW_JSON", "./vlsp2025_law.json"),
             law_image_dir=os.getenv("LAW_IMAGE_DIR", ""),

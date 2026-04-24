@@ -147,11 +147,11 @@ class Config:
     qdrant_url: str = "http://localhost:6333"
     collection_examples: str = "berry_examples"
     collection_law: str = "berry_law"
-    output_file: str = "predictions.json"
+    output_file: str = "predictions.json.ollama"
 
     # Retrieval settings
-    top_k_examples: int = 5
-    top_k_laws: int = 5
+    top_k_examples: int = 3
+    top_k_laws: int = 3
     recreate_on_dim_mismatch: bool = False
     debug_retrieval: bool = False
 
@@ -204,7 +204,7 @@ class Config:
             qdrant_url=os.getenv("QDRANT_URL", "http://localhost:6333"),
             collection_examples=os.getenv("EXAMPLE_COLLECTION", "berry_examples"),
             collection_law=os.getenv("LAW_COLLECTION", "berry_law"),
-            output_file=os.getenv("OUTPUT_FILE", "predictions.json"),
+            output_file=os.getenv("OUTPUT_FILE", "predictions.json.ollama"),
             top_k_examples=int(os.getenv("TOP_K_EXAMPLES", "5")),
             top_k_laws=int(os.getenv("TOP_K_LAWS", "5")),
             recreate_on_dim_mismatch=os.getenv("RECREATE_ON_DIM_MISMATCH", "false").lower() == "true",
@@ -2449,8 +2449,8 @@ def call_llm(prompt: str, question_type: str = "") -> Tuple[str, str]:
 
     try:
         response = requests.post(
-            #f"{config.ollama_base_url}/api/generate", #Ollama
-            f"{config.openai_base_url}/v1/chat/completions", #OpenAI
+            f"{config.ollama_base_url}/api/generate", #Ollama
+            #f"{config.openai_base_url}/v1/chat/completions", #OpenAI
             json=payload,
             timeout=config.llm_timeout,
         )
@@ -2475,6 +2475,98 @@ def call_llm(prompt: str, question_type: str = "") -> Tuple[str, str]:
         fallback = "SAI" if is_yes_no_question(question_type) else "A"
         return fallback, ""
 
+LOG_FILE = "llm_calls.jsonl"  # dùng JSONL để append liên tục
+
+LOG_FILE_TXT = "llm_call.txt"
+
+
+def append_log(data):
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+def append_log_txt(data):
+    with open(LOG_FILE_TXT, "a", encoding="utf-8") as f:
+        f.write("\n" + "="*100 + "\n")
+        f.write(f"ID: {data.get('id')}\n")
+        f.write(f"QUESTION_TYPE: {data.get('question_type')}\n")
+        f.write(f"STATUS_CODE: {data.get('status_code')}\n")
+        f.write(f"PREDICTION: {data.get('prediction')}\n")
+        f.write(f"RAW_OUTPUT: {data.get('raw_output')}\n")
+        f.write("\n[PROMPT]\n")
+        f.write(data.get("prompt", ""))
+        f.write("\n")
+
+
+
+
+def call_llm_openai(prompt: str, question_type: str = "", sample_id: str = "") -> Tuple[str, str]:
+    system_prompt = (
+        "Bạn là trợ lý giải bài MLQA-TSR về luật giao thông Việt Nam. "
+        "Ưu tiên tuyệt đối điều luật và đặc trưng trực quan then chốt của ảnh. "
+        "Nếu là câu trắc nghiệm, chỉ trả lời đúng 1 ký tự: A, B, C hoặc D. "
+        "Nếu là câu đúng/sai, chỉ trả lời đúng 1 từ: ĐÚNG hoặc SAI. "
+        "Không giải thích, không viết thêm."
+    )
+
+    payload = {
+        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": config.llm_num_predict,
+        "temperature": config.llm_temperature,
+        "top_p": 0.9,
+        "repetition_penalty": 1.05,
+    }
+
+    try:
+        response = requests.post(
+            f"{config.openai_base_url}/v1/chat/completions",
+            json=payload,
+            timeout=config.llm_timeout,
+        )
+
+        raw_text = ""
+        pred = ""
+
+        if response.status_code == 200:
+            data = response.json()
+            raw_text = str(
+                data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+            ).strip()
+
+            pred = extract_choice(raw_text, question_type=question_type)
+        else:
+            print(f"[LLM ERROR] status={response.status_code}")
+            pred = "SAI" if is_yes_no_question(question_type) else "A"
+
+        # ✅ LOG THEO TỪNG SAMPLE
+        append_log({
+            "id": sample_id,
+            "question_type": question_type,
+            "prompt": prompt,   # tránh file quá to
+            "prediction": pred,
+            "raw_output": raw_text,
+            "status_code": response.status_code,
+        })
+
+        if config.debug_retrieval:
+            print(f"[DEBUG][LLM] raw_output={raw_text[:500]}")
+            print(f"[DEBUG][LLM] normalized_prediction={pred}")
+        return pred, raw_text
+
+    except Exception as e:
+        append_log({
+            "id": sample_id,
+            "error": str(e)
+        })
+
+        print(f"[LLM ERROR] {e}")
+        fallback = "SAI" if is_yes_no_question(question_type) else "A"
+        return fallback, ""
 
 def compute_rule_confidence(
     item: Dict[str, Any],
@@ -2644,48 +2736,55 @@ def fuse_predictions(
 def run_eval(client: QdrantClient, dataset: QaDataset) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
 
-    with open(config.output_file, "w", encoding="utf-8") as f:
-        f.write("[\n")
+    import os
+    import json
+    import re
 
+    file_path = config.output_file
+    file_exists = os.path.exists(file_path)
+    file_empty = (not file_exists) or os.path.getsize(file_path) == 0
+
+    with open(file_path, "a+", encoding="utf-8") as f:
+        # ===== INIT FILE =====
+        if file_empty:
+            f.write("[\n")
+            first = True
+        else:
+            f.seek(0)
+            text = f.read().strip()
+
+            # fix nếu file đang dở dang
+            text = re.sub(r",\s*\]$", "\n]", text)
+
+            if text.endswith("]"):
+                # remove dấu ] cuối để append
+                f.seek(0)
+                f.truncate()
+                f.write(text[:-1].rstrip())
+
+            # xác định có cần dấu , không
+            first = text.strip() in ["[", ""]
+
+        f.seek(0, os.SEEK_END)
+
+        # ===== MAIN LOOP =====
         for idx, item in enumerate(dataset, 1):
             print("=" * 100)
-            print(f"[EVAL] {idx}/{len(dataset.items)} | id={item.get('id')} | image_id={item.get('image_id')}")
+            print(f"[EVAL] {idx}/{len(dataset.items)} | id={item.get('id')}")
 
             retrieved_examples, retrieved_laws, image_description = retrieve_examples_and_laws(client, item)
             item["image_description"] = image_description
+
             rule_prediction, rule_debug = choose_by_law_priority(item, retrieved_laws)
             prompt = build_prompt(item, retrieved_examples, retrieved_laws, image_description)
-            llm_prediction, raw_output = call_llm(prompt, question_type=item.get("question_type", ""))
+            llm_prediction, raw_output = call_llm_openai(prompt, question_type=item.get("question_type", ""),sample_id=item.get("id", ""))
 
-            rule_confidence = compute_rule_confidence(
-                item=item,
-                rule_prediction=rule_prediction,
-                rule_debug=rule_debug,
-                retrieved_laws=retrieved_laws,
-            )
-            llm_confidence = compute_llm_confidence(
-                item=item,
-                llm_prediction=llm_prediction,
-                raw_output=raw_output,
-                retrieved_laws=retrieved_laws,
-            )
+            rule_confidence = compute_rule_confidence(item, rule_prediction, rule_debug, retrieved_laws)
+            llm_confidence = compute_llm_confidence(item, llm_prediction, raw_output, retrieved_laws)
+
             prediction, decision_source, fused_scores, fused_margin = fuse_predictions(
-                item=item,
-                rule_prediction=rule_prediction,
-                llm_prediction=llm_prediction,
-                rule_confidence=rule_confidence,
-                llm_confidence=llm_confidence,
+                item, rule_prediction, llm_prediction, rule_confidence, llm_confidence
             )
-
-            if config.debug_retrieval:
-                print(f"[DEBUG][PROMPT]\n{prompt}")
-                print(
-                    f"[DEBUG][DECISION] rule_prediction={rule_prediction} | llm_prediction={llm_prediction} | "
-                    f"rule_conf={rule_confidence:.4f} | llm_conf={llm_confidence:.4f} | "
-                    f"final={prediction} | source={decision_source} | margin={fused_margin:.4f}"
-                )
-                print(f"[DEBUG][DECISION] fused_scores={fused_scores}")
-                print(f"[DEBUG][DECISION] rule_debug={rule_debug}")
 
             result = {
                 "id": item.get("id"),
@@ -2702,7 +2801,10 @@ def run_eval(client: QdrantClient, dataset: QaDataset) -> List[Dict[str, Any]]:
                 "rule_debug": rule_debug,
                 "llm_raw_output": raw_output,
                 "retrieved_example_ids": [x["payload"].get("id") for x in retrieved_examples],
-                "retrieved_law_ids": [x["payload"].get("article_id") or x["payload"].get("id") for x in retrieved_laws],
+                "retrieved_law_ids": [
+                    x["payload"].get("article_id") or x["payload"].get("id")
+                    for x in retrieved_laws
+                ],
                 "retrieved_laws": [
                     {
                         "id": x["payload"].get("id"),
@@ -2722,18 +2824,63 @@ def run_eval(client: QdrantClient, dataset: QaDataset) -> List[Dict[str, Any]]:
             }
 
             results.append(result)
-            json.dump(result, f, ensure_ascii=False)
-            if idx < len(dataset.items):
+
+            # ✅ dấu , ở trước
+            if not first:
                 f.write(",\n")
             else:
-                f.write("\n")
+                first = False
+
+            json.dump(result, f, ensure_ascii=False)
             f.flush()
 
-        f.write("]\n")
+        # ===== CLOSE JSON =====
+        f.write("\n]\n")
 
     return results
 
+def load_predicted_ids(pred_file: str) -> Set[str]:
+    path = Path(pred_file)
+    if not path.exists():
+        return set()
 
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+
+        if not text:
+            print(f"[WARN] prediction file rỗng: {pred_file}")
+            return set()
+
+        # file mới mở nhưng chưa ghi item nào
+        if text == "[":
+            return set()
+
+        # nếu crash giữa chừng mà chưa có dấu ] cuối thì tự đóng lại
+        if not text.endswith("]"):
+            text = text.rstrip()
+            # bỏ dấu phẩy cuối nếu có
+            text = re.sub(r",\s*$", "", text)
+            text += "\n]"
+
+        # bỏ dấu phẩy thừa trước ] nếu có
+        text = re.sub(r",\s*\]", "\n]", text)
+
+        data = json.loads(text)
+
+        if not isinstance(data, list):
+            print(f"[WARN] prediction file không phải JSON list: {pred_file}")
+            return set()
+
+        return {
+            str(x.get("id", "")).strip()
+            for x in data
+            if isinstance(x, dict) and x.get("id") and x.get("prediction")
+        }
+
+    except json.JSONDecodeError as e:
+        print(f"[WARN] prediction file bị lỗi JSON: {pred_file}")
+        print(f"[WARN] {e}")
+        return set()
 # =========================================================
 # Main
 # =========================================================
@@ -2787,8 +2934,16 @@ def main() -> None:
         index_laws(client, law_ds)
     else:
         print("[SKIP] laws already indexed")
-
     print("[INFO] Running evaluation / prediction...")
+    predicted_ids = load_predicted_ids(config.output_file)
+
+    eval_ds.items = [
+        item for item in eval_ds.items
+        if str(item.get("id", "")).strip() not in predicted_ids
+    ]
+
+    print(f"[INFO] Remaining eval items: {len(eval_ds.items)}")
+
     results = run_eval(client, eval_ds)
     print(f"[DONE] Saved predictions to {config.output_file} | total={len(results)}")
 

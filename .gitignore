@@ -25,7 +25,7 @@ env/
 # ========================
 # Output files
 # ========================
-predictions.json
+predictions.json.ollama
 retrieval_report.json
 *.out
 

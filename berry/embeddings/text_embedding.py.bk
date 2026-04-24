@@ -1,0 +1,27 @@
+from typing import List
+import requests
+from berry.config import config
+
+def _post_jina_embeddings(texts: List[str], task: str) -> List[List[float]]:
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {config.jina_api_key}"}
+    payload = {"model": config.jina_model, "task": task, "input": texts}
+    response = requests.post(config.embed_url, headers=headers, json=payload, timeout=config.embed_timeout)
+    response.raise_for_status()
+    data = response.json()
+    rows = sorted(data.get("data", []), key=lambda x: x["index"])
+    if not rows:
+        raise RuntimeError(f"Jina trả về rỗng cho task={task}")
+    return [row["embedding"] for row in rows]
+
+def embed_text_query(text: str) -> List[float]:
+    return _post_jina_embeddings([text], task="retrieval.query")[0]
+
+def embed_text_passage(text: str) -> List[float]:
+    return _post_jina_embeddings([text], task="retrieval.passage")[0]
+
+def validate_embedding_dims() -> int:
+    query_dim = len(embed_text_query("test dimension"))
+    passage_dim = len(embed_text_passage("test dimension"))
+    if query_dim != passage_dim:
+        raise RuntimeError(f"Text embedding dim không khớp: retrieval.query={query_dim}, retrieval.passage={passage_dim}")
+    return query_dim

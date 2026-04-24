@@ -189,6 +189,13 @@ def recall_at_k(pred_ids: List[str], gold_set: Set[str], k: int) -> float:
     return len(topk & gold_set) / len(gold_set)
 
 
+def precision_at_k(pred_ids: List[str], gold_set: Set[str], k: int) -> float:
+    topk = pred_ids[:k]
+    if not topk:
+        return 0.0
+    return len(set(topk) & gold_set) / len(topk)
+
+
 def reciprocal_rank(pred_ids: List[str], gold_set: Set[str]) -> float:
     if not gold_set:
         return 0.0
@@ -196,6 +203,12 @@ def reciprocal_rank(pred_ids: List[str], gold_set: Set[str]) -> float:
         if x in gold_set:
             return 1.0 / i
     return 0.0
+
+
+def f2_score(p: float, r: float) -> float:
+    if p == 0.0 and r == 0.0:
+        return 0.0
+    return 5.0 * p * r / (4.0 * p + r)
 
 
 # =========================
@@ -206,9 +219,13 @@ def evaluate_laws(predictions: List[Dict[str, Any]], eval_items: List[Dict[str, 
     eval_by_id = {x["id"]: x for x in eval_items}
 
     total = 0
+
     strict_h1 = strict_h3 = strict_h5 = 0
     loose_h1 = loose_h3 = loose_h5 = 0
-    strict_r5 = loose_r5 = 0.0
+
+    strict_p5 = strict_r5 = strict_f2_5 = 0.0
+    loose_p5 = loose_r5 = loose_f2_5 = 0.0
+
     strict_mrr = loose_mrr = 0.0
 
     debug_rows = []
@@ -227,16 +244,32 @@ def evaluate_laws(predictions: List[Dict[str, Any]], eval_items: List[Dict[str, 
 
         total += 1
 
+        # strict metrics
         strict_h1 += hit_at_k(pred_strict, gold_strict, 1)
         strict_h3 += hit_at_k(pred_strict, gold_strict, 3)
         strict_h5 += hit_at_k(pred_strict, gold_strict, 5)
-        strict_r5 += recall_at_k(pred_strict, gold_strict, 5)
+
+        strict_p5_q = precision_at_k(pred_strict, gold_strict, 5)
+        strict_r5_q = recall_at_k(pred_strict, gold_strict, 5)
+        strict_f2_q = f2_score(strict_p5_q, strict_r5_q)
+
+        strict_p5 += strict_p5_q
+        strict_r5 += strict_r5_q
+        strict_f2_5 += strict_f2_q
         strict_mrr += reciprocal_rank(pred_strict, gold_strict)
 
+        # loose metrics
         loose_h1 += hit_at_k(pred_loose, gold_loose, 1)
         loose_h3 += hit_at_k(pred_loose, gold_loose, 3)
         loose_h5 += hit_at_k(pred_loose, gold_loose, 5)
-        loose_r5 += recall_at_k(pred_loose, gold_loose, 5)
+
+        loose_p5_q = precision_at_k(pred_loose, gold_loose, 5)
+        loose_r5_q = recall_at_k(pred_loose, gold_loose, 5)
+        loose_f2_q = f2_score(loose_p5_q, loose_r5_q)
+
+        loose_p5 += loose_p5_q
+        loose_r5 += loose_r5_q
+        loose_f2_5 += loose_f2_q
         loose_mrr += reciprocal_rank(pred_loose, gold_loose)
 
         if len(debug_rows) < 20:
@@ -246,8 +279,16 @@ def evaluate_laws(predictions: List[Dict[str, Any]], eval_items: List[Dict[str, 
                 "gold_loose": sorted(gold_loose),
                 "pred_strict_top5": pred_strict[:5],
                 "pred_loose_top5": pred_loose[:5],
+
                 "strict_hit@5": bool(set(pred_strict[:5]) & gold_strict),
+                "strict_precision@5": strict_p5_q,
+                "strict_recall@5": strict_r5_q,
+                "strict_f2@5": strict_f2_q,
+
                 "loose_hit@5": bool(set(pred_loose[:5]) & gold_loose),
+                "loose_precision@5": loose_p5_q,
+                "loose_recall@5": loose_r5_q,
+                "loose_f2@5": loose_f2_q,
             })
 
     return {
@@ -256,14 +297,18 @@ def evaluate_laws(predictions: List[Dict[str, Any]], eval_items: List[Dict[str, 
             "hit@1": safe_div(strict_h1, total),
             "hit@3": safe_div(strict_h3, total),
             "hit@5": safe_div(strict_h5, total),
+            "precision@5": safe_div(strict_p5, total),
             "recall@5": safe_div(strict_r5, total),
+            "f2@5": safe_div(strict_f2_5, total),
             "mrr": safe_div(strict_mrr, total),
         },
         "loose": {
             "hit@1": safe_div(loose_h1, total),
             "hit@3": safe_div(loose_h3, total),
             "hit@5": safe_div(loose_h5, total),
+            "precision@5": safe_div(loose_p5, total),
             "recall@5": safe_div(loose_r5, total),
+            "f2@5": safe_div(loose_f2_5, total),
             "mrr": safe_div(loose_mrr, total),
         },
         "sample_debug": debug_rows,
@@ -288,6 +333,11 @@ def evaluate_examples(
     train_by_id = {x["id"]: x for x in train_items}
 
     total = 0
+
+    sum_precision = 0.0
+    sum_recall = 0.0
+    sum_f2 = 0.0
+
     qtype_score = 0.0
     answer_score = 0.0
     overlap_hit = 0
@@ -309,11 +359,13 @@ def evaluate_examples(
 
         qtype = query.get("question_type")
         answer = query.get("answer")
-        articles = article_id_set(query)
+        gold_articles = article_id_set(query)
 
         qtype_match = 0
         answer_match = 0
         overlap = False
+
+        retrieved_articles = set()
 
         for ex_id in retrieved_ids[:5]:
             ex = train_by_id.get(ex_id)
@@ -326,18 +378,39 @@ def evaluate_examples(
             if normalize_answer(ex.get("answer")) == normalize_answer(answer):
                 answer_match += 1
 
-            if articles & article_id_set(ex):
+            ex_articles = article_id_set(ex)
+            retrieved_articles |= ex_articles
+
+            if gold_articles & ex_articles:
                 overlap = True
 
+        # metric cũ
         denom = max(1, min(5, len(retrieved_ids)))
         qtype_score += qtype_match / denom
         answer_score += answer_match / denom
         overlap_hit += int(overlap)
 
+        # metric mới: Precision / Recall / F2 theo article
+        correct_retrieved_articles = gold_articles & retrieved_articles
+
+        precision_q = safe_div(len(correct_retrieved_articles), len(retrieved_articles))
+        recall_q = safe_div(len(correct_retrieved_articles), len(gold_articles))
+        f2_q = f2_score(precision_q, recall_q)
+
+        sum_precision += precision_q
+        sum_recall += recall_q
+        sum_f2 += f2_q
+
         if len(debug_rows) < 20:
             debug_rows.append({
                 "id": qid,
                 "retrieved_example_ids_top5": retrieved_ids[:5],
+                "gold_articles": sorted(gold_articles),
+                "retrieved_articles_from_examples_top5": sorted(retrieved_articles),
+                "correct_retrieved_articles": sorted(correct_retrieved_articles),
+                "precision@examples_top5": precision_q,
+                "recall@examples_top5": recall_q,
+                "f2@examples_top5": f2_q,
                 "qtype_match_count_top5": qtype_match,
                 "answer_match_count_top5": answer_match,
                 "article_overlap_hit@5": overlap,
@@ -345,9 +418,17 @@ def evaluate_examples(
 
     return {
         "total": total,
+
+        # metric mới
+        "avg_precision": safe_div(sum_precision, total),
+        "avg_recall": safe_div(sum_recall, total),
+        "avg_f2": safe_div(sum_f2, total),
+
+        # metric cũ giữ lại
         "avg_qtype_match": safe_div(qtype_score, total),
         "avg_answer_match": safe_div(answer_score, total),
         "article_overlap_hit@5": safe_div(overlap_hit, total),
+
         "sample_debug": debug_rows,
     }
 
@@ -390,7 +471,8 @@ def evaluate_answers(predictions: List[Dict[str, Any]], eval_items: List[Dict[st
             missing_prediction += 1
             is_correct = False
         else:
-            if pred_answer not in {"A", "B", "C", "D"}:
+            valid_labels = {"A", "B", "C", "D", "ĐÚNG", "SAI"}
+            if pred_answer not in valid_labels:
                 invalid_prediction += 1
             is_correct = (pred_answer == gold_answer)
 
@@ -415,6 +497,7 @@ def evaluate_answers(predictions: List[Dict[str, Any]], eval_items: List[Dict[st
     return {
         "total": total,
         "correct": correct,
+        "score": f"{correct}/{total}",
         "accuracy": safe_div(correct, total),
         "missing_prediction": missing_prediction,
         "invalid_prediction": invalid_prediction,
@@ -447,6 +530,12 @@ def main():
     answer_report = evaluate_answers(predictions, eval_items)
 
     report = {
+        "summary": {
+            "score": f"{answer_report['correct']}/{answer_report['total']}",
+            "correct": answer_report["correct"],
+            "total": answer_report["total"],
+            "accuracy": answer_report["accuracy"],
+        },
         "law_retrieval": law_report,
         "example_retrieval": example_report,
         "answer_evaluation": answer_report,
@@ -454,6 +543,10 @@ def main():
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
+
+    print("\n===== SUMMARY =====")
+    print(f"SCORE: {answer_report['correct']}/{answer_report['total']}")
+    print(f"ACCURACY: {answer_report['accuracy']:.4f}")
 
     print("\n===== LAW RETRIEVAL =====")
     print(json.dumps(law_report, indent=2, ensure_ascii=False))

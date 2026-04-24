@@ -46,12 +46,12 @@ Hệ thống kết hợp:
 
 pip install -r requirementes.txt
 
+
 Chạy Qdrant:
 docker run -p 6333:6333 qdrant/qdrant
 
----
 
---
+python download_model.py
 
 ## V. Run
 
@@ -62,6 +62,16 @@ python berry_pipeline_qwen.py
 ## Output
 
 predictions.json
+
+
+## Đánh giá kết quả:
+
+python evaluate_retrieval.py
+
+# Output đánh giá
+
+retrieval_report.json
+
 
 ---
 
